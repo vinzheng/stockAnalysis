@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: ashare-quant
+Version: 0.1.0
+Summary: A-share quant analysis MVP
+Requires-Python: >=3.11
+Requires-Dist: akshare>=1.14.70
+Requires-Dist: baostock>=0.8.9
+Requires-Dist: numpy>=2.2.0
+Requires-Dist: pandas>=2.2.3
+Requires-Dist: plotly>=6.0.0
+Requires-Dist: PyYAML>=6.0.2
+Requires-Dist: streamlit>=1.44.0

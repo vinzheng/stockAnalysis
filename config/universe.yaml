@@ -1,0 +1,62 @@
+market:
+  exclude_st: true
+  min_price: 5
+  min_turnover_amount: 200000000
+  min_turnover_rate: 1.0
+  max_symbols: 80
+  candidate_selection_mode: composite
+  candidate_selection_weights:
+    turnover_amount: 0.4
+    turnover_rate: 0.35
+    amplitude: 0.15
+    pct_change_abs: 0.10
+
+strategy:
+  ma_fast: 20
+  ma_mid: 50
+  ma_slow: 100
+  breakout_window: 55
+  volume_window: 20
+  volume_ratio_min: 1.7
+  rsi_window: 14
+  use_rsi_filter: false
+  rsi_min: 52
+  rsi_max: 75
+  atr_window: 14
+  atr_stop_multiple: 2.5
+
+scan:
+  history_days: 260
+  history_cache_max_trading_day_lag: 3
+  top_n: 15
+  strict_post_close_mode: true
+  scan_timeout_seconds: 45
+
+market_timing:
+  enabled: true
+  min_trend_breadth_risk_on: 0.55
+  min_trend_breadth_neutral: 0.45
+  use_index_filter: true
+  benchmark_symbol: "000300"
+  benchmark_short_ma: 20
+  benchmark_long_ma: 60
+
+data_source:
+  tushare_token_env: "TUSHARE_TOKEN"
+  tushare_dotenv_path: ".env"
+  tushare_token: ""
+  use_tushare_for_index: false
+
+intraday_prompt:
+  breakout_confirm_pct: 0.0015
+  breakout_chase_limit_pct: 0.055
+  pullback_near_ma_pct: 0.02
+  pullback_breakout_buffer_pct: 0.02
+  ma_break_buffer_pct: 0.007
+  breakout_fail_buffer_pct: 0.007
+  flat_intraday_pct: 0.008
+  scan_trial_min_live_delta_pct: 0.003
+  scan_observe_abs_delta_pct: 0.025
+  scan_sell_confirm_delta_pct: -0.008
+  trial_score_min: 70
+  pullback_score_min: 65

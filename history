@@ -1,0 +1,74 @@
+会话备份（2026-03-16）
+
+1. 目标与范围
+- 目标：快速搭建 A 股量化分析系统，支持选股、买卖信号、回测与可视化。
+- 范围：先做研究/提示系统，不做自动实盘下单。
+
+2. 今日完成的工程内容
+- 初始化项目结构与依赖：AkShare + pandas + YAML 配置。
+- 完成核心模块：
+	- src/ashare_quant/data.py（数据获取、缓存、重试、fallback）
+	- src/ashare_quant/strategy.py（指标、买卖信号、评分）
+	- src/ashare_quant/backtest.py（单票回测）
+	- src/ashare_quant/cli.py（scan/backtest 命令入口）
+- 完成可视化面板：streamlit_app.py（扫描、个股图、信号、回测展示）。
+- 更新文档：README.md。
+
+3. 关键问题与修复
+- 问题A：Windows 终端里 python 命令仍指向 WindowsApps 占位程序。
+	- 处理：用 .venv\Scripts\python.exe 作为稳定运行方式。
+- 问题B：AkShare 某些主接口偶发网络/结构异常。
+	- 处理：
+		- 快照接口：stock_zh_a_spot_em 失败时回退 stock_zh_a_spot。
+		- 历史接口：stock_zh_a_hist 失败/异常时回退 stock_zh_a_daily。
+		- 增加重试机制与单票失败跳过逻辑。
+- 问题C：看板信号列不直观。
+	- 处理：buy/sell 显示改为“是/否”，并增加中文列名。
+- 问题D：数据日期滞后误用风险。
+	- 处理：加入“数据新鲜度”提示与严格收盘后模式。
+
+4. 严格收盘后模式（已启用）
+- 配置：config/universe.yaml
+	- scan.strict_post_close_mode: true
+- 行为：
+	- 当请求日期是今天，但最新完整日线日期 < 今天时：
+		- 阻止输出正式次日选股建议。
+		- CLI 给出明确提示。
+		- 保存参考结果到 data/latest_scan_stale.csv（仅参考）。
+- 可选放宽：
+	- scan 命令加 --allow-stale 可查看过期数据下的参考结果。
+
+5. 已验证结果
+- CLI 严格模式验证：
+	- python -m ashare_quant.cli scan
+	- 当日未落地时会提示并阻止正式输出。
+- CLI 放宽模式验证：
+	- python -m ashare_quant.cli scan --allow-stale --top 5
+	- 可输出参考结果。
+- 回测验证：
+	- python -m ashare_quant.cli backtest 001309 --start 2024-01-01
+	- 曾得到：trades=3, win_rate=100.00%, total_return=267.66%, max_drawdown=15.91%
+- Streamlit 已启动并可访问：
+	- http://localhost:8501
+
+6. 你提出并确认的操作策略
+- 采用“严格收盘后模式”。
+- 每晚 18:00 后再运行正式扫描结果，作为次日参考。
+
+7. 常用命令（当前机器建议）
+- 安装/更新：
+	- & ".\.venv\Scripts\python.exe" -m pip install -e .
+- 正式扫描（严格模式）：
+	- & ".\.venv\Scripts\python.exe" -m ashare_quant.cli scan --top 20
+- 参考扫描（允许过期）：
+	- & ".\.venv\Scripts\python.exe" -m ashare_quant.cli scan --allow-stale --top 20
+- 单票回测：
+	- & ".\.venv\Scripts\python.exe" -m ashare_quant.cli backtest 600519 --start 2022-01-01
+- 启动看板：
+	- & ".\.venv\Scripts\streamlit.exe" run streamlit_app.py
+
+8. 明天可直接续做的下一步
+- 方案1：加“18:00后自动重试直到当日日线就绪”的脚本/任务。
+- 方案2：接入消息通知（企业微信/邮箱）做每日推送。
+- 方案3：加入指数择时和组合仓位控制。
+
