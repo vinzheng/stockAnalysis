@@ -1432,22 +1432,33 @@ def cached_scan(
     refresh_token: int,
 ) -> tuple[pd.DataFrame, str | None, bool, str]:
     del refresh_token
+    target_date = resolve_scan_target_date(as_of_text)
     try:
         result = scan_market(config_path, as_of_text, top)
         scan_df = normalize_scan_dataframe(result)
         status_message = result.attrs.get("status_message")
         scan_source = "partial" if result.attrs.get("is_partial") else "complete"
+        if scan_df.empty:
+            fallback_df, fallback_message, fallback_ready, fallback_source = load_latest_scan_from_disk(
+                config_fingerprint,
+                target_date,
+            )
+            if not fallback_df.empty:
+                status_message = "本次云端扫描未产出满足条件的结果，当前继续展示最近一次缓存结果。"
+                if fallback_message:
+                    status_message = f"{status_message} {fallback_message}"
+                return fallback_df, status_message, fallback_ready, fallback_source
         return scan_df, status_message, True, scan_source
     except DataNotReadyError as error:
         fallback_df, _, fallback_ready, fallback_source = load_latest_scan_from_disk(
             config_fingerprint,
-            resolve_scan_target_date(as_of_text),
+            target_date,
         )
         return fallback_df, str(error), fallback_ready, fallback_source
     except ScanInProgressError as error:
         fallback_df, fallback_message, fallback_ready, fallback_source = load_latest_scan_from_disk(
             config_fingerprint,
-            resolve_scan_target_date(as_of_text),
+            target_date,
         )
         status_message = str(error)
         if fallback_message:

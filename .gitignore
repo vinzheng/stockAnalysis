@@ -2,5 +2,11 @@
 __pycache__/
 *.pyc
 data/*.csv
+!data/latest_scan.csv
+!data/latest_scan_partial.csv
+!data/latest_snapshot.csv
+!data/latest_snapshot_active.csv
+!data/latest_fund_rank.csv
+!data/market_snapshot_summary_history.csv
 .env
 .env.local
