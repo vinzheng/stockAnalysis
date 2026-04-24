@@ -18,10 +18,8 @@ from pandas.tseries.offsets import BDay
 
 from ashare_quant.config import load_config
 
-try:
-    import efinance as ef
-except ImportError:  # pragma: no cover - optional dependency until installed
-    ef = None
+ef = None
+_efinance_import_attempted = False
 
 try:
     import tushare as ts
@@ -89,6 +87,21 @@ SNAPSHOT_COLUMN_ALIASES = {
     "涨跌幅": ["涨跌幅"],
     "振幅": ["振幅"],
 }
+
+
+def _get_efinance_module():
+    global ef, _efinance_import_attempted
+    if _efinance_import_attempted:
+        return ef
+
+    _efinance_import_attempted = True
+    try:
+        import efinance as imported_ef
+    except Exception:  # pragma: no cover - cloud/runtime-specific import failures should trigger fallback
+        ef = None
+    else:
+        ef = imported_ef
+    return ef
 
 
 def _has_usable_snapshot_rows(snapshot: pd.DataFrame) -> bool:
@@ -486,20 +499,22 @@ class MarketDataClient:
         return EFINANCE_ADJUST_MAP.get(adjust, 1)
 
     def _get_snapshot_from_efinance(self) -> pd.DataFrame:
-        if ef is None:
+        ef_module = _get_efinance_module()
+        if ef_module is None:
             raise RuntimeError("efinance is not installed")
-        snapshot = self._with_retry("fetch efinance universe snapshot", ef.stock.get_realtime_quotes)
+        snapshot = self._with_retry("fetch efinance universe snapshot", ef_module.stock.get_realtime_quotes)
         return self._normalize_snapshot(snapshot)
 
     def _get_history_from_efinance(self, symbol: str, start_date: datetime, end_date: datetime, adjust: str) -> pd.DataFrame:
-        if ef is None:
+        ef_module = _get_efinance_module()
+        if ef_module is None:
             raise RuntimeError("efinance is not installed")
 
         normalized_symbol = self._normalize_symbol(symbol)
         symbol_code = normalized_symbol[2:] if normalized_symbol.startswith(("sh", "sz", "bj")) else normalized_symbol
         history = self._with_retry(
             f"fetch efinance history for {normalized_symbol}",
-            lambda: ef.stock.get_quote_history(
+            lambda: ef_module.stock.get_quote_history(
                 stock_codes=symbol_code,
                 beg=start_date.strftime("%Y%m%d"),
                 end=end_date.strftime("%Y%m%d"),
