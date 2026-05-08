@@ -734,23 +734,13 @@ class MarketDataClient:
     def get_universe_snapshot(self) -> pd.DataFrame:
         cache_path = self._snapshot_cache_path()
         active_cache_path = self._active_snapshot_cache_path()
-        # Priority: efinance → cache → akshare_spot legacy fallback → akshare_em last-resort
+        # Priority: efinance → akshare_spot legacy fallback → akshare_em last-resort → cache
         try:
             snapshot = self._get_snapshot_from_efinance()
             if not _has_usable_snapshot_rows(snapshot):
                 raise RuntimeError("efinance snapshot returned no rows")
             self._set_fetch_detail("snapshot", "efinance")
         except Exception:
-            if active_cache_path.exists():
-                active_snapshot = self._load_cached_snapshot(active_cache_path)
-                if _has_usable_snapshot_rows(active_snapshot) and _has_active_snapshot_activity(active_snapshot):
-                    self._set_fetch_detail("snapshot", "cache", active_cache_path.name)
-                    return active_snapshot
-            if cache_path.exists():
-                cached_snapshot = self._load_cached_snapshot(cache_path)
-                if _has_usable_snapshot_rows(cached_snapshot) and _has_active_snapshot_activity(cached_snapshot):
-                    self._set_fetch_detail("snapshot", "cache", cache_path.name)
-                    return cached_snapshot
             try:
                 snapshot = self._with_retry("fetch fallback universe snapshot", ak.stock_zh_a_spot)
                 snapshot = self._normalize_snapshot(snapshot)
@@ -758,11 +748,24 @@ class MarketDataClient:
                     raise RuntimeError("akshare legacy snapshot returned no rows")
                 self._set_fetch_detail("snapshot", "akshare_spot")
             except Exception:
-                snapshot = self._with_retry("fetch universe snapshot", ak.stock_zh_a_spot_em)
-                snapshot = self._normalize_snapshot(snapshot)
-                if not _has_usable_snapshot_rows(snapshot):
-                    raise RuntimeError("akshare_em snapshot returned no rows")
-                self._set_fetch_detail("snapshot", "akshare_em")
+                try:
+                    snapshot = self._with_retry("fetch universe snapshot", ak.stock_zh_a_spot_em)
+                    snapshot = self._normalize_snapshot(snapshot)
+                    if not _has_usable_snapshot_rows(snapshot):
+                        raise RuntimeError("akshare_em snapshot returned no rows")
+                    self._set_fetch_detail("snapshot", "akshare_em")
+                except Exception:
+                    if active_cache_path.exists():
+                        active_snapshot = self._load_cached_snapshot(active_cache_path)
+                        if _has_usable_snapshot_rows(active_snapshot) and _has_active_snapshot_activity(active_snapshot):
+                            self._set_fetch_detail("snapshot", "cache", active_cache_path.name)
+                            return active_snapshot
+                    if cache_path.exists():
+                        cached_snapshot = self._load_cached_snapshot(cache_path)
+                        if _has_usable_snapshot_rows(cached_snapshot) and _has_active_snapshot_activity(cached_snapshot):
+                            self._set_fetch_detail("snapshot", "cache", cache_path.name)
+                            return cached_snapshot
+                    raise
 
         if _has_active_snapshot_activity(snapshot):
             snapshot.to_csv(cache_path, index=False, encoding="utf-8-sig")
