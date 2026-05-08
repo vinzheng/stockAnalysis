@@ -3621,16 +3621,43 @@ def render_market_overview_section(config_path: str, config_fingerprint: str, sc
     header_col.subheader("市场总览")
     market_snapshot_refresh_token = int(st.session_state.get("market_snapshot_refresh_token", 0))
     refresh_snapshot = action_col.button("刷新盘面快照", width="stretch")
+    snapshot_df: pd.DataFrame
     if refresh_snapshot:
         market_snapshot_refresh_token += 1
         st.session_state.market_snapshot_refresh_token = market_snapshot_refresh_token
+        with st.spinner("正在刷新盘面快照..."):
+            snapshot_df = cached_snapshot_dataframe(market_snapshot_refresh_token)
+        snapshot_source = str(snapshot_df.attrs.get("snapshot_source", "") or "")
+        snapshot_note = str(snapshot_df.attrs.get("snapshot_source_note", "") or "")
+        if snapshot_source == "cache":
+            st.session_state.market_snapshot_refresh_message = (
+                f"本次刷新未拿到实时盘面，已回退到本地缓存（{snapshot_note or 'latest_snapshot.csv'}）。"
+            )
+            st.session_state.market_snapshot_refresh_level = "warning"
+        elif snapshot_source:
+            st.session_state.market_snapshot_refresh_message = f"本次刷新已从 {snapshot_source} 获取最新盘面快照。"
+            st.session_state.market_snapshot_refresh_level = "success"
+        else:
+            st.session_state.market_snapshot_refresh_message = "本次刷新未拿到可用盘面快照。"
+            st.session_state.market_snapshot_refresh_level = "warning"
+    else:
+        snapshot_df = cached_snapshot_dataframe(market_snapshot_refresh_token)
+
+    refresh_message = str(st.session_state.get("market_snapshot_refresh_message", "") or "")
+    refresh_level = str(st.session_state.get("market_snapshot_refresh_level", "info") or "info")
+    if refresh_message:
+        if refresh_level == "success":
+            st.success(refresh_message)
+        elif refresh_level == "warning":
+            st.warning(refresh_message)
+        else:
+            st.info(refresh_message)
 
     latest_signal_date = get_latest_signal_date(scan_df)
     latest_signal_date_text = latest_signal_date.isoformat() if latest_signal_date else None
     market_overview = cached_market_overview(config_path, config_fingerprint, latest_signal_date_text)
     market_index_history = cached_market_index_history(config_path, config_fingerprint, latest_signal_date_text)
     outlook = build_market_outlook(scan_df, market_overview)
-    snapshot_df = cached_snapshot_dataframe(market_snapshot_refresh_token)
     snapshot_summary = build_market_snapshot_summary(snapshot_df)
     market_summary = build_market_summary_analysis(outlook, market_overview, snapshot_summary)
     snapshot_path = DATA_DIR / "latest_snapshot.csv"
