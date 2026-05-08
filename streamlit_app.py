@@ -1508,14 +1508,8 @@ def cached_symbol_snapshot(symbol: str) -> dict[str, object] | None:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_snapshot_dataframe() -> pd.DataFrame:
-    snapshot_path = DATA_DIR / "latest_snapshot.csv"
-    if snapshot_path.exists():
-        snapshot_df = pd.read_csv(snapshot_path)
-        snapshot_df.attrs["snapshot_source"] = "cache"
-        snapshot_df.attrs["snapshot_source_note"] = snapshot_path.name
-        return snapshot_df
-
+def cached_snapshot_dataframe(refresh_token: int) -> pd.DataFrame:
+    del refresh_token
     client = MarketDataClient(DATA_DIR)
     try:
         snapshot_df = client.get_universe_snapshot()
@@ -1524,6 +1518,12 @@ def cached_snapshot_dataframe() -> pd.DataFrame:
         snapshot_df.attrs["snapshot_source_note"] = fetch_detail.get("note", "")
         return snapshot_df
     except RuntimeError:
+        snapshot_path = DATA_DIR / "latest_snapshot.csv"
+        if snapshot_path.exists():
+            snapshot_df = pd.read_csv(snapshot_path)
+            snapshot_df.attrs["snapshot_source"] = "cache"
+            snapshot_df.attrs["snapshot_source_note"] = snapshot_path.name
+            return snapshot_df
         return pd.DataFrame()
 
 
@@ -2484,6 +2484,7 @@ def render_gold_section() -> None:
 
         if show_table_in_chart:
             table_df = history[[column for column in ["date", "open", "high", "low", "close", "ma10", "ma20", "ma60"] if column in history.columns]].tail(20).copy()
+            table_df = table_df.sort_values("date", ascending=False).reset_index(drop=True)
             table_df["date"] = table_df["date"].dt.strftime("%Y-%m-%d")
             for column in ["open", "high", "low", "close", "ma10", "ma20", "ma60"]:
                 if column in table_df.columns:
@@ -2504,6 +2505,7 @@ def render_gold_section() -> None:
 
     with data_tab:
         data_table = history[[column for column in ["date", "open", "high", "low", "close", "ma10", "ma20", "ma60"] if column in history.columns]].tail(60).copy()
+        data_table = data_table.sort_values("date", ascending=False).reset_index(drop=True)
         data_table["date"] = data_table["date"].dt.strftime("%Y-%m-%d")
         for column in ["open", "high", "low", "close", "ma10", "ma20", "ma60"]:
             if column in data_table.columns:
@@ -3615,14 +3617,20 @@ def render_scan_section(config_path: str, intraday_preset: str = "跟随配置")
 
 def render_market_overview_section(config_path: str, config_fingerprint: str, scan_df: pd.DataFrame) -> None:
     st.markdown(MARKET_SIGNAL_CSS, unsafe_allow_html=True)
-    st.subheader("市场总览")
+    header_col, action_col = st.columns([4, 1.2])
+    header_col.subheader("市场总览")
+    market_snapshot_refresh_token = int(st.session_state.get("market_snapshot_refresh_token", 0))
+    refresh_snapshot = action_col.button("刷新盘面快照", width="stretch")
+    if refresh_snapshot:
+        market_snapshot_refresh_token += 1
+        st.session_state.market_snapshot_refresh_token = market_snapshot_refresh_token
 
     latest_signal_date = get_latest_signal_date(scan_df)
     latest_signal_date_text = latest_signal_date.isoformat() if latest_signal_date else None
     market_overview = cached_market_overview(config_path, config_fingerprint, latest_signal_date_text)
     market_index_history = cached_market_index_history(config_path, config_fingerprint, latest_signal_date_text)
     outlook = build_market_outlook(scan_df, market_overview)
-    snapshot_df = cached_snapshot_dataframe()
+    snapshot_df = cached_snapshot_dataframe(market_snapshot_refresh_token)
     snapshot_summary = build_market_snapshot_summary(snapshot_df)
     market_summary = build_market_summary_analysis(outlook, market_overview, snapshot_summary)
     snapshot_path = DATA_DIR / "latest_snapshot.csv"

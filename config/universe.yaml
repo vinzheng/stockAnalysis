@@ -50,6 +50,7 @@ data_source:
 intraday_prompt:
   breakout_confirm_pct: 0.0015
   breakout_chase_limit_pct: 0.055
+  entry_weak_open_limit_pct: 0.003
   pullback_near_ma_pct: 0.02
   pullback_breakout_buffer_pct: 0.02
   ma_break_buffer_pct: 0.007

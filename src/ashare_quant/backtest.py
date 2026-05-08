@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from ashare_quant.strategy import get_breakout_chase_limit_pct
+from ashare_quant.strategy import get_breakout_chase_limit_pct, get_entry_weak_open_limit_pct
 
 
 @dataclass(slots=True)
@@ -160,9 +160,17 @@ def run_single_symbol_backtest(history: pd.DataFrame, symbol: str, atr_stop_mult
     pending_exit = False
     pending_entry_type = ""
     pending_breakout_high = math.nan
+    pending_signal_close = math.nan
     breakout_chase_limit_pct = 0.04
+    entry_weak_open_limit_pct = 0.005
     if "breakout_chase_limit_pct" in history.attrs:
         breakout_chase_limit_pct = float(history.attrs["breakout_chase_limit_pct"])
+    elif "config" in history.attrs:
+        breakout_chase_limit_pct = get_breakout_chase_limit_pct(history.attrs["config"])
+    if "entry_weak_open_limit_pct" in history.attrs:
+        entry_weak_open_limit_pct = float(history.attrs["entry_weak_open_limit_pct"])
+    elif "config" in history.attrs:
+        entry_weak_open_limit_pct = get_entry_weak_open_limit_pct(history.attrs["config"])
 
     for row in history.itertuples(index=False):
         open_price = float(row.open)
@@ -183,13 +191,25 @@ def run_single_symbol_backtest(history: pd.DataFrame, symbol: str, atr_stop_mult
                 and not math.isnan(pending_breakout_high)
                 and open_price > pending_breakout_high * (1 + breakout_chase_limit_pct)
             )
+            skip_weak_open_entry = (
+                not math.isnan(pending_signal_close)
+                and (
+                    open_price < pending_signal_close * (1 - entry_weak_open_limit_pct)
+                    or (
+                        pending_entry_type == "突破买入"
+                        and not math.isnan(pending_breakout_high)
+                        and open_price < pending_breakout_high * (1 - entry_weak_open_limit_pct)
+                    )
+                )
+            )
             pending_entry = False
-            if not skip_breakout_entry:
+            if not (skip_breakout_entry or skip_weak_open_entry):
                 position = cash / open_price
                 cash = 0.0
                 entry_price = open_price
             pending_entry_type = ""
             pending_breakout_high = math.nan
+            pending_signal_close = math.nan
 
         if position > 0:
             if sell_signal:
@@ -199,6 +219,7 @@ def run_single_symbol_backtest(history: pd.DataFrame, symbol: str, atr_stop_mult
             pending_entry_type = str(getattr(row, "entry_signal_type", "") or getattr(row, "raw_buy_signal_type", "") or "")
             breakout_high = getattr(row, "breakout_high", math.nan)
             pending_breakout_high = float(breakout_high) if pd.notna(breakout_high) else math.nan
+            pending_signal_close = close
 
         equity = cash if position == 0 else position * close
         equity_curve.append(equity)

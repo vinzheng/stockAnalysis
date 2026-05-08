@@ -11,6 +11,20 @@ def get_breakout_chase_limit_pct(config: dict | None) -> float:
     return float(prompt_cfg.get("breakout_chase_limit_pct", 0.04))
 
 
+def get_entry_weak_open_limit_pct(config: dict | None) -> float:
+    if not config:
+        return 0.005
+    prompt_cfg = config.get("intraday_prompt", {}) or {}
+    return float(prompt_cfg.get("entry_weak_open_limit_pct", 0.005))
+
+
+def get_entry_score_thresholds(config: dict | None) -> tuple[float, float]:
+    if not config:
+        return 70.0, 65.0
+    prompt_cfg = config.get("intraday_prompt", {}) or {}
+    return float(prompt_cfg.get("trial_score_min", 70.0)), float(prompt_cfg.get("pullback_score_min", 65.0))
+
+
 def compute_rsi(series: pd.Series, window: int) -> pd.Series:
     delta = series.diff()
     gains = delta.clip(lower=0)
@@ -54,6 +68,7 @@ def enrich_indicators(history: pd.DataFrame, config: dict) -> pd.DataFrame:
 def apply_position_state_machine(history: pd.DataFrame, config: dict) -> pd.DataFrame:
     atr_stop_multiple = float(config["strategy"].get("atr_stop_multiple", 0))
     breakout_chase_limit_pct = get_breakout_chase_limit_pct(config)
+    entry_weak_open_limit_pct = get_entry_weak_open_limit_pct(config)
     result = history.copy()
 
     effective_buy_signal: list[bool] = []
@@ -78,6 +93,7 @@ def apply_position_state_machine(history: pd.DataFrame, config: dict) -> pd.Data
     active_entry_type = ""
     pending_entry_type = ""
     pending_breakout_high = np.nan
+    pending_signal_close = np.nan
 
     for index, row in enumerate(result.itertuples(index=False)):
         row_open = float(row.open)
@@ -98,8 +114,19 @@ def apply_position_state_machine(history: pd.DataFrame, config: dict) -> pd.Data
                 and pd.notna(pending_breakout_high)
                 and row_open > float(pending_breakout_high) * (1 + breakout_chase_limit_pct)
             )
+            skip_weak_open_entry = (
+                pd.notna(pending_signal_close)
+                and (
+                    row_open < float(pending_signal_close) * (1 - entry_weak_open_limit_pct)
+                    or (
+                        pending_entry_type == "突破买入"
+                        and pd.notna(pending_breakout_high)
+                        and row_open < float(pending_breakout_high) * (1 - entry_weak_open_limit_pct)
+                    )
+                )
+            )
             pending_entry = False
-            if not skip_breakout_entry:
+            if not (skip_breakout_entry or skip_weak_open_entry):
                 in_position = True
                 entry_price = row_open
                 entry_atr = row_atr
@@ -107,6 +134,7 @@ def apply_position_state_machine(history: pd.DataFrame, config: dict) -> pd.Data
                 active_entry_type = pending_entry_type or str(getattr(row, "raw_buy_signal_type", "") or "")
             pending_entry_type = ""
             pending_breakout_high = np.nan
+            pending_signal_close = np.nan
 
         current_stop_price = np.nan
         current_atr_stop_signal = False
@@ -140,6 +168,7 @@ def apply_position_state_machine(history: pd.DataFrame, config: dict) -> pd.Data
             pending_entry = True
             pending_entry_type = raw_buy_type
             pending_breakout_high = float(row.breakout_high) if pd.notna(getattr(row, "breakout_high", np.nan)) else np.nan
+            pending_signal_close = row_close
             current_position_state = "待买入"
             current_next_action = "买入"
             current_signal_context = "建仓"
@@ -183,10 +212,17 @@ def apply_position_state_machine(history: pd.DataFrame, config: dict) -> pd.Data
 def add_signal_columns(history: pd.DataFrame, config: dict) -> pd.DataFrame:
     strategy = config["strategy"]
     result = enrich_indicators(history, config)
+    breakout_score_min, pullback_score_min = get_entry_score_thresholds(config)
     use_rsi_filter = bool(strategy.get("use_rsi_filter", False))
     rsi_buy_filter = result["rsi"].between(strategy["rsi_min"], strategy["rsi_max"]) if use_rsi_filter else True
     rsi_add_on_filter = (
         result["rsi"].between(max(strategy["rsi_min"] - 2, 50), strategy["rsi_max"]) if use_rsi_filter else True
+    )
+    base_score = (
+        result["momentum_20"].fillna(0) * 40
+        + (result["volume_ratio"].fillna(0).clip(0, 3) * 20)
+        + ((result["distance_to_high"].fillna(0) - 0.85).clip(lower=0) * 100)
+        + (result["trend_spread"].fillna(0).clip(lower=0) * 400)
     )
     breakout_entry_signal = (
         (result["close"] > result["ma_fast"])
@@ -194,6 +230,7 @@ def add_signal_columns(history: pd.DataFrame, config: dict) -> pd.DataFrame:
         & (result["ma_mid"] > result["ma_slow"])
         & (result["close"] >= result["breakout_high"])
         & (result["volume_ratio"] >= strategy["volume_ratio_min"])
+        & (base_score >= breakout_score_min)
         & rsi_buy_filter
     )
     recent_breakout_setup = breakout_entry_signal.shift(1).rolling(8, min_periods=1).max().fillna(False)
@@ -207,6 +244,7 @@ def add_signal_columns(history: pd.DataFrame, config: dict) -> pd.DataFrame:
         & (result["close"] >= result["breakout_high"] * 0.98)
         & (result["close"] < result["breakout_high"])
         & (result["volume_ratio"] >= 1.0)
+        & (base_score >= pullback_score_min)
         & rsi_add_on_filter
         & ~breakout_entry_signal
     )
@@ -254,14 +292,10 @@ def add_signal_columns(history: pd.DataFrame, config: dict) -> pd.DataFrame:
         & ~result["buy_signal"]
         & ~result["base_sell_signal"]
     )
-    result["score"] = (
-        result["momentum_20"].fillna(0) * 40
-        + (result["volume_ratio"].fillna(0).clip(0, 3) * 20)
-        + ((result["distance_to_high"].fillna(0) - 0.85).clip(lower=0) * 100)
-        + (result["trend_spread"].fillna(0).clip(lower=0) * 400)
-    )
+    result["score"] = base_score
     final_result = apply_position_state_machine(result, config)
     final_result.attrs["breakout_chase_limit_pct"] = get_breakout_chase_limit_pct(config)
+    final_result.attrs["entry_weak_open_limit_pct"] = get_entry_weak_open_limit_pct(config)
     return final_result
 
 
@@ -287,6 +321,7 @@ def latest_signal_summary(history: pd.DataFrame, config: dict | None = None) -> 
     execution_advice = "当前没有新的执行信号，继续观察。"
     sell_reason = ""
     breakout_chase_limit_pct = get_breakout_chase_limit_pct(config)
+    entry_weak_open_limit_pct = get_entry_weak_open_limit_pct(config)
     if action_row is not None:
         if action in {"买入", "补仓", "卖出"}:
             signal_age = int(len(history) - history.index.get_loc(action_row.name) - 1)
@@ -294,9 +329,12 @@ def latest_signal_summary(history: pd.DataFrame, config: dict | None = None) -> 
         if action == "买入":
             chase_suffix = ""
             if entry_signal_type == "突破买入":
-                chase_suffix = f" 若次日开盘高于突破位约 {breakout_chase_limit_pct:.1%} 以上，不建议机械追价。"
+                chase_suffix = (
+                    f" 若次日开盘高于突破位约 {breakout_chase_limit_pct:.1%} 以上，或重新低于突破位，不建议机械追价。"
+                )
             execution_advice = (
-                f"今天收盘确认{entry_signal_type or '买点'}，默认按下一交易日开盘再执行。{chase_suffix}"
+                f"今天收盘确认{entry_signal_type or '买点'}，默认按下一交易日开盘再执行。"
+                f" 若次日开盘低于当日收盘约 {entry_weak_open_limit_pct:.1%} 以上，建议取消机械买入。{chase_suffix}"
                 if signal_age == 0
                 else f"最近一次{entry_signal_type or '买点'}已过去 {signal_age} 个交易日，不适合机械追价，优先等待重新突破或回踩确认。"
             )
