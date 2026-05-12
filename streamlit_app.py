@@ -1125,9 +1125,37 @@ def render_sector_fund_flow_section() -> None:
             st.caption(f"10 日板块资金流获取失败：{ten_day_error}")
         return
 
-    section_tabs = st.tabs(["近5日累计净流入", "当日净流入", "近10日累计净流入"])
+    section_tabs = st.tabs(["当日净流入", "近5日累计净流入", "近10日累计净流入"])
 
     with section_tabs[0]:
+        display_today_df = prepare_sector_fund_flow_display(today_df, "净额")
+        if display_today_df.empty:
+            st.info("当日板块资金流暂无可展示数据。")
+            if today_error:
+                st.caption(f"失败原因：{today_error}")
+        else:
+            today_values = pd.to_numeric(today_df.get("净额"), errors="coerce")
+            metric_left, metric_mid, metric_right = st.columns(3)
+            metric_left.metric("净流入板块", int((today_values > 0).sum()))
+            metric_mid.metric("净流出板块", int((today_values < 0).sum()))
+            metric_right.metric("样本板块数", int(len(today_df)))
+
+            left_col, right_col = st.columns([1.05, 1.35])
+            today_table = display_today_df[[column for column in ["行业", "净额", "流入资金", "流出资金", "行业-涨跌幅", "领涨股", "领涨股-涨跌幅"] if column in display_today_df.columns]].copy()
+            for column in ["净额", "流入资金", "流出资金"]:
+                if column in today_table.columns:
+                    today_table[column] = today_table[column].map(lambda value: f"{float(value):.2f} 亿" if pd.notna(value) else "-")
+            for column in ["行业-涨跌幅", "领涨股-涨跌幅"]:
+                if column in today_table.columns:
+                    today_table[column] = today_table[column].map(format_percent_value)
+            today_table = today_table.rename(columns={"行业": "板块", "净额": "主力净额", "流入资金": "流入资金", "流出资金": "流出资金", "行业-涨跌幅": "板块涨跌幅", "领涨股": "领涨股", "领涨股-涨跌幅": "领涨股涨跌幅"})
+            left_col.caption("当日净流入前 5 / 后 5")
+            left_col.dataframe(today_table, width="stretch", hide_index=True)
+            right_col.plotly_chart(build_sector_fund_flow_figure(display_today_df[["行业", "净额"]], "当日板块资金净额"), width="stretch")
+            if today_error:
+                st.caption(f"接口提示：{today_error}")
+
+    with section_tabs[1]:
         five_day_value_column = "净额" if "净额" in five_day_df.columns else "资金流入净额"
         display_five_day_df = prepare_sector_fund_flow_display(five_day_df, five_day_value_column)
         if display_five_day_df.empty:
@@ -1180,34 +1208,6 @@ def render_sector_fund_flow_section() -> None:
             if sector_errors:
                 for error_text in sector_errors:
                     st.caption(error_text)
-
-    with section_tabs[1]:
-        display_today_df = prepare_sector_fund_flow_display(today_df, "净额")
-        if display_today_df.empty:
-            st.info("当日板块资金流暂无可展示数据。")
-            if today_error:
-                st.caption(f"失败原因：{today_error}")
-        else:
-            today_values = pd.to_numeric(today_df.get("净额"), errors="coerce")
-            metric_left, metric_mid, metric_right = st.columns(3)
-            metric_left.metric("净流入板块", int((today_values > 0).sum()))
-            metric_mid.metric("净流出板块", int((today_values < 0).sum()))
-            metric_right.metric("样本板块数", int(len(today_df)))
-
-            left_col, right_col = st.columns([1.05, 1.35])
-            today_table = display_today_df[[column for column in ["行业", "净额", "流入资金", "流出资金", "行业-涨跌幅", "领涨股", "领涨股-涨跌幅"] if column in display_today_df.columns]].copy()
-            for column in ["净额", "流入资金", "流出资金"]:
-                if column in today_table.columns:
-                    today_table[column] = today_table[column].map(lambda value: f"{float(value):.2f} 亿" if pd.notna(value) else "-")
-            for column in ["行业-涨跌幅", "领涨股-涨跌幅"]:
-                if column in today_table.columns:
-                    today_table[column] = today_table[column].map(format_percent_value)
-            today_table = today_table.rename(columns={"行业": "板块", "净额": "主力净额", "流入资金": "流入资金", "流出资金": "流出资金", "行业-涨跌幅": "板块涨跌幅", "领涨股": "领涨股", "领涨股-涨跌幅": "领涨股涨跌幅"})
-            left_col.caption("当日净流入前 5 / 后 5")
-            left_col.dataframe(today_table, width="stretch", hide_index=True)
-            right_col.plotly_chart(build_sector_fund_flow_figure(display_today_df[["行业", "净额"]], "当日板块资金净额"), width="stretch")
-            if today_error:
-                st.caption(f"接口提示：{today_error}")
 
     with section_tabs[2]:
         ten_day_value_column = "净额" if "净额" in ten_day_df.columns else "资金流入净额"
