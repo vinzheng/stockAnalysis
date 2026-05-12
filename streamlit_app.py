@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import sys
 from datetime import date, datetime
+from io import StringIO
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -14,7 +15,11 @@ if str(SRC_DIR) not in sys.path:
 import akshare as ak
 import pandas as pd
 import plotly.graph_objects as go
+import py_mini_racer
+import requests
 import streamlit as st
+from akshare.stock_feature.stock_fund_flow import _get_file_content_ths
+from bs4 import BeautifulSoup
 from plotly.subplots import make_subplots
 
 from ashare_quant.backtest import analyze_entry_slices, analyze_exit_slices, analyze_signal_statistics, run_single_symbol_backtest
@@ -869,6 +874,396 @@ def build_market_index_figure(history: pd.DataFrame) -> go.Figure:
     return figure
 
 
+def build_sector_fund_flow_figure(dataframe: pd.DataFrame, title: str) -> go.Figure:
+    figure = go.Figure()
+    if dataframe.empty:
+        figure.update_layout(title=title, height=380)
+        return figure
+
+    chart_df = dataframe.copy()
+    chart_df["净额"] = pd.to_numeric(chart_df["净额"], errors="coerce")
+    chart_df = chart_df.dropna(subset=["行业", "净额"]).sort_values("净额", ascending=True)
+    colors = ["#16a34a" if value >= 0 else "#dc2626" for value in chart_df["净额"]]
+    figure.add_trace(
+        go.Bar(
+            x=chart_df["净额"],
+            y=chart_df["行业"],
+            orientation="h",
+            marker_color=colors,
+            text=[f"{value:.2f} 亿" for value in chart_df["净额"]],
+            textposition="outside",
+            hovertemplate="%{y}<br>净额: %{x:.2f} 亿<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        title=title,
+        height=430,
+        margin={"l": 12, "r": 20, "t": 42, "b": 12},
+        xaxis_title="净额(亿)",
+        yaxis_title="",
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    figure.add_vline(x=0, line_width=1, line_dash="dash", line_color="#94a3b8")
+    return figure
+
+
+def prepare_sector_fund_flow_display(dataframe: pd.DataFrame, value_column: str) -> pd.DataFrame:
+    if dataframe.empty or value_column not in dataframe.columns or "行业" not in dataframe.columns:
+        return pd.DataFrame()
+
+    working_df = dataframe.copy()
+    working_df[value_column] = pd.to_numeric(working_df[value_column], errors="coerce")
+    working_df = working_df.dropna(subset=["行业", value_column])
+    if working_df.empty:
+        return working_df
+
+    top_df = working_df.nlargest(5, value_column)
+    bottom_df = working_df.nsmallest(5, value_column)
+    return pd.concat([top_df, bottom_df], ignore_index=True).drop_duplicates(subset=["行业"], keep="first")
+
+
+def parse_cn_amount_text(value: object) -> float | None:
+    if pd.isna(value):
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text or text == "--":
+        return None
+    multiplier = 1.0
+    if text.endswith("亿"):
+        multiplier = 100000000.0
+        text = text[:-1]
+    elif text.endswith("万"):
+        multiplier = 10000.0
+        text = text[:-1]
+    try:
+        return float(text) * multiplier
+    except ValueError:
+        return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_ths_sector_constituents(sector_name: str) -> tuple[pd.DataFrame, str | None]:
+    try:
+        industry_map_df = ak.stock_board_industry_name_ths()
+    except Exception as error:
+        return pd.DataFrame(), str(error)
+
+    matched_rows = industry_map_df.loc[industry_map_df["name"].astype(str).str.strip() == str(sector_name).strip()]
+    if matched_rows.empty:
+        return pd.DataFrame(), f"未找到板块 {sector_name} 的同花顺代码"
+
+    sector_code = str(matched_rows.iloc[0]["code"])
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "Referer": f"http://q.10jqka.com.cn/thshy/detail/code/{sector_code}/",
+    }
+
+    def _load_page(page_number: int) -> tuple[pd.DataFrame, int]:
+        page_url = (
+            f"http://q.10jqka.com.cn/thshy/detail/code/{sector_code}/"
+            if page_number == 1
+            else f"http://q.10jqka.com.cn/thshy/detail/code/{sector_code}/page/{page_number}/"
+        )
+        response = requests.get(page_url, headers=headers, timeout=20)
+        response.raise_for_status()
+        response.encoding = "gbk"
+        page_tables = pd.read_html(StringIO(response.text))
+        if not page_tables:
+            return pd.DataFrame(), 1
+        soup = BeautifulSoup(response.text, features="lxml")
+        page_info = soup.find(name="span", attrs={"class": "page_info"})
+        total_pages = int(page_info.text.split("/")[1]) if page_info and "/" in page_info.text else 1
+        return page_tables[0], total_pages
+
+    try:
+        first_page_df, total_pages = _load_page(1)
+    except Exception as error:
+        return pd.DataFrame(), str(error)
+
+    tables = [first_page_df] if not first_page_df.empty else []
+    for page_number in range(2, total_pages + 1):
+        try:
+            page_df, _ = _load_page(page_number)
+        except Exception:
+            continue
+        if not page_df.empty:
+            tables.append(page_df)
+
+    if not tables:
+        return pd.DataFrame(), "板块成分股页面返回空结果"
+
+    result = pd.concat(tables, ignore_index=True)
+    result.columns = [re.sub(r"\s+", "", str(column)).strip() for column in result.columns]
+    if "代码" in result.columns:
+        result["代码"] = result["代码"].astype(str).str.extract(r"(\d+)", expand=False).fillna("").str.zfill(6)
+    if "名称" in result.columns:
+        result["名称"] = result["名称"].astype(str).str.strip()
+    if "成交额" in result.columns:
+        result["成交额数值"] = result["成交额"].map(parse_cn_amount_text)
+    return result, None
+
+
+def build_top_sector_stock_candidates(
+    sector_df: pd.DataFrame,
+    scan_df: pd.DataFrame,
+    config_path: str,
+    config_fingerprint: str,
+    limit_per_sector: int = 5,
+) -> tuple[list[dict[str, object]], list[str]]:
+    if sector_df.empty or "行业" not in sector_df.columns:
+        return [], []
+
+    config = load_config(config_path)
+    latest_signal_date = get_latest_signal_date(scan_df)
+    end_date = latest_signal_date or date.today()
+    start_date = end_date - pd.Timedelta(days=420)
+    scan_lookup = scan_df.copy() if not scan_df.empty else pd.DataFrame()
+    if not scan_lookup.empty and "symbol" in scan_lookup.columns:
+        scan_lookup["symbol"] = scan_lookup["symbol"].map(normalize_market_symbol)
+
+    sector_blocks: list[dict[str, object]] = []
+    errors: list[str] = []
+    top_sector_df = sector_df.copy()
+    top_sector_df["净额"] = pd.to_numeric(top_sector_df["净额"], errors="coerce")
+    top_sector_df = top_sector_df.dropna(subset=["行业", "净额"]).nlargest(3, "净额")
+
+    for sector_row in top_sector_df.itertuples(index=False):
+        sector_name = str(getattr(sector_row, "行业", "") or "").strip()
+        constituents_df, sector_error = cached_ths_sector_constituents(sector_name)
+        if constituents_df.empty:
+            errors.append(f"{sector_name} 成分股获取失败：{sector_error or '无可用数据'}")
+            continue
+
+        candidate_df = constituents_df.copy()
+        if "成交额数值" in candidate_df.columns:
+            candidate_df = candidate_df.sort_values("成交额数值", ascending=False, na_position="last")
+        candidate_df = candidate_df.head(30).copy()
+
+        ranked_rows: list[dict[str, object]] = []
+        for candidate in candidate_df.itertuples(index=False):
+            raw_symbol = str(getattr(candidate, "代码", "") or "").strip()
+            symbol = normalize_market_symbol(raw_symbol)
+            if not symbol:
+                continue
+            name = str(getattr(candidate, "名称", "") or "")
+
+            if not scan_lookup.empty and symbol in set(scan_lookup["symbol"]):
+                matched_row = scan_lookup.loc[scan_lookup["symbol"] == symbol].iloc[0]
+                ranked_rows.append(
+                    {
+                        "symbol": symbol,
+                        "name": name or str(matched_row.get("name", "") or "-"),
+                        "score": pd.to_numeric(matched_row.get("score"), errors="coerce"),
+                        "action": str(matched_row.get("action", "观察") or "观察"),
+                        "close": pd.to_numeric(matched_row.get("close"), errors="coerce"),
+                        "volume_ratio": pd.to_numeric(matched_row.get("volume_ratio"), errors="coerce"),
+                        "rsi": pd.to_numeric(matched_row.get("rsi"), errors="coerce"),
+                        "date": matched_row.get("date"),
+                        "source": "扫描缓存",
+                    }
+                )
+                continue
+
+            history = cached_history(symbol, start_date, end_date, config_path, config_fingerprint)
+            if history.empty:
+                continue
+            summary = latest_signal_summary(history, config)
+            if not summary:
+                continue
+            latest_row = history.iloc[-1]
+            ranked_rows.append(
+                {
+                    "symbol": symbol,
+                    "name": name or "-",
+                    "score": pd.to_numeric(summary.get("score"), errors="coerce"),
+                    "action": str(summary.get("action", "观察") or "观察"),
+                    "close": pd.to_numeric(latest_row.get("close"), errors="coerce"),
+                    "volume_ratio": pd.to_numeric(summary.get("volume_ratio"), errors="coerce"),
+                    "rsi": pd.to_numeric(summary.get("rsi"), errors="coerce"),
+                    "date": pd.to_datetime(latest_row.get("date"), errors="coerce"),
+                    "source": "即时评分",
+                }
+            )
+
+        ranked_df = pd.DataFrame(ranked_rows)
+        if ranked_df.empty:
+            errors.append(f"{sector_name} 未能生成可排序的评分股票")
+            continue
+
+        ranked_df = ranked_df.drop_duplicates(subset=["symbol"], keep="first")
+        ranked_df = ranked_df.sort_values(["score", "volume_ratio", "rsi"], ascending=[False, False, False], na_position="last").head(limit_per_sector)
+        sector_blocks.append(
+            {
+                "sector_name": sector_name,
+                "sector_net_inflow": pd.to_numeric(getattr(sector_row, "净额", None), errors="coerce"),
+                "sector_return_10d": pd.to_numeric(getattr(sector_row, "阶段涨跌幅", None), errors="coerce"),
+                "stocks": ranked_df.reset_index(drop=True),
+            }
+        )
+
+    return sector_blocks, errors
+
+
+def render_sector_fund_flow_section() -> None:
+    st.divider()
+    st.subheader("板块资金流")
+    st.caption("这里补充行业板块资金净额前 5 和后 5。近 5 日和近 10 日部分当前展示的是累计净额图，而不是逐日历史曲线。")
+
+    five_day_df, five_day_error = cached_sector_fund_flow("5日")
+    today_df, today_error = cached_sector_fund_flow("今日")
+    ten_day_df, ten_day_error = cached_sector_fund_flow("10日")
+
+    if five_day_df.empty and today_df.empty and ten_day_df.empty:
+        st.info("当前没有可展示的板块资金流数据。")
+        if five_day_error:
+            st.caption(f"5 日板块资金流获取失败：{five_day_error}")
+        if today_error:
+            st.caption(f"今日板块资金流获取失败：{today_error}")
+        if ten_day_error:
+            st.caption(f"10 日板块资金流获取失败：{ten_day_error}")
+        return
+
+    section_tabs = st.tabs(["近5日累计净流入", "当日净流入", "近10日累计净流入"])
+
+    with section_tabs[0]:
+        five_day_value_column = "净额" if "净额" in five_day_df.columns else "资金流入净额"
+        display_five_day_df = prepare_sector_fund_flow_display(five_day_df, five_day_value_column)
+        if display_five_day_df.empty:
+            st.info("近 5 日板块资金流暂无可展示数据。")
+            if five_day_error:
+                st.caption(f"失败原因：{five_day_error}")
+        else:
+            five_day_values = pd.to_numeric(five_day_df.get(five_day_value_column), errors="coerce")
+            metric_left, metric_mid, metric_right = st.columns(3)
+            metric_left.metric("5日净流入板块", int((five_day_values > 0).sum()))
+            metric_mid.metric("5日净流出板块", int((five_day_values < 0).sum()))
+            metric_right.metric("样本板块数", int(len(five_day_df)))
+
+            left_col, right_col = st.columns([1.05, 1.35])
+            five_day_table = display_five_day_df[[column for column in ["行业", five_day_value_column, "流入资金", "流出资金", "阶段涨跌幅", "公司家数"] if column in display_five_day_df.columns]].copy()
+            if five_day_value_column in five_day_table.columns:
+                five_day_table[five_day_value_column] = five_day_table[five_day_value_column].map(lambda value: f"{float(value):.2f} 亿" if pd.notna(value) else "-")
+            for column in ["流入资金", "流出资金"]:
+                if column in five_day_table.columns:
+                    five_day_table[column] = five_day_table[column].map(lambda value: f"{float(value):.2f} 亿" if pd.notna(value) else "-")
+            if "阶段涨跌幅" in five_day_table.columns:
+                five_day_table["阶段涨跌幅"] = five_day_table["阶段涨跌幅"].map(format_percent_value)
+            five_day_table = five_day_table.rename(columns={"行业": "板块", five_day_value_column: "5日净额", "流入资金": "5日流入资金", "流出资金": "5日流出资金", "阶段涨跌幅": "5日涨跌幅", "公司家数": "公司家数"})
+            left_col.caption("近 5 日累计净额前 5 / 后 5")
+            left_col.dataframe(five_day_table, width="stretch", hide_index=True)
+            chart_df = display_five_day_df[["行业", five_day_value_column]].rename(columns={five_day_value_column: "净额"})
+            right_col.plotly_chart(build_sector_fund_flow_figure(chart_df, "近 5 日板块累计净额"), width="stretch")
+            if five_day_error:
+                st.caption(f"接口提示：{five_day_error}")
+
+            sector_blocks, sector_errors = build_top_sector_stock_candidates(five_day_df.rename(columns={five_day_value_column: "净额"}) if five_day_value_column != "净额" else five_day_df, st.session_state.get("scan_df", pd.DataFrame()), CONFIG_PATH, compute_config_fingerprint(CONFIG_PATH))
+            st.divider()
+            st.caption("5 日资金流入前三板块，各列出 5 支评分更高的股票。优先复用扫描缓存评分，不足部分再即时补算。")
+            if not sector_blocks:
+                st.info("当前还没拿到可展示的板块高评分股票列表。")
+            for sector_block in sector_blocks:
+                metric_col1, metric_col2 = st.columns(2)
+                metric_col1.metric(f"{sector_block['sector_name']} 5日净额", f"{float(sector_block['sector_net_inflow']):.2f} 亿" if pd.notna(sector_block.get("sector_net_inflow")) else "-")
+                metric_col2.metric(f"{sector_block['sector_name']} 5日涨跌幅", format_percent_value(sector_block.get("sector_return_10d")) if pd.notna(sector_block.get("sector_return_10d")) else "-")
+                display_stock_df = sector_block["stocks"][[column for column in ["symbol", "name", "score", "action", "close", "volume_ratio", "rsi", "date", "source"] if column in sector_block["stocks"].columns]].copy()
+                if "score" in display_stock_df.columns:
+                    display_stock_df["score"] = display_stock_df["score"].map(format_score_value)
+                for column in ["close", "volume_ratio", "rsi"]:
+                    if column in display_stock_df.columns:
+                        display_stock_df[column] = display_stock_df[column].map(format_two_decimals)
+                if "date" in display_stock_df.columns:
+                    display_stock_df["date"] = pd.to_datetime(display_stock_df["date"], errors="coerce").map(lambda value: value.strftime("%Y-%m-%d") if pd.notna(value) else "-")
+                display_stock_df = display_stock_df.rename(columns={"symbol": "代码", "name": "名称", "score": "评分", "action": "动作", "close": "最新收盘", "volume_ratio": "量比", "rsi": "RSI", "date": "信号日期", "source": "评分来源"})
+                st.dataframe(display_stock_df, width="stretch", hide_index=True)
+            if sector_errors:
+                for error_text in sector_errors:
+                    st.caption(error_text)
+
+    with section_tabs[1]:
+        display_today_df = prepare_sector_fund_flow_display(today_df, "净额")
+        if display_today_df.empty:
+            st.info("当日板块资金流暂无可展示数据。")
+            if today_error:
+                st.caption(f"失败原因：{today_error}")
+        else:
+            today_values = pd.to_numeric(today_df.get("净额"), errors="coerce")
+            metric_left, metric_mid, metric_right = st.columns(3)
+            metric_left.metric("净流入板块", int((today_values > 0).sum()))
+            metric_mid.metric("净流出板块", int((today_values < 0).sum()))
+            metric_right.metric("样本板块数", int(len(today_df)))
+
+            left_col, right_col = st.columns([1.05, 1.35])
+            today_table = display_today_df[[column for column in ["行业", "净额", "流入资金", "流出资金", "行业-涨跌幅", "领涨股", "领涨股-涨跌幅"] if column in display_today_df.columns]].copy()
+            for column in ["净额", "流入资金", "流出资金"]:
+                if column in today_table.columns:
+                    today_table[column] = today_table[column].map(lambda value: f"{float(value):.2f} 亿" if pd.notna(value) else "-")
+            for column in ["行业-涨跌幅", "领涨股-涨跌幅"]:
+                if column in today_table.columns:
+                    today_table[column] = today_table[column].map(format_percent_value)
+            today_table = today_table.rename(columns={"行业": "板块", "净额": "主力净额", "流入资金": "流入资金", "流出资金": "流出资金", "行业-涨跌幅": "板块涨跌幅", "领涨股": "领涨股", "领涨股-涨跌幅": "领涨股涨跌幅"})
+            left_col.caption("当日净流入前 5 / 后 5")
+            left_col.dataframe(today_table, width="stretch", hide_index=True)
+            right_col.plotly_chart(build_sector_fund_flow_figure(display_today_df[["行业", "净额"]], "当日板块资金净额"), width="stretch")
+            if today_error:
+                st.caption(f"接口提示：{today_error}")
+
+    with section_tabs[2]:
+        ten_day_value_column = "净额" if "净额" in ten_day_df.columns else "资金流入净额"
+        display_ten_day_df = prepare_sector_fund_flow_display(ten_day_df, ten_day_value_column)
+        if display_ten_day_df.empty:
+            st.info("近 10 日板块资金流暂无可展示数据。")
+            if ten_day_error:
+                st.caption(f"失败原因：{ten_day_error}")
+        else:
+            ten_day_values = pd.to_numeric(ten_day_df.get(ten_day_value_column), errors="coerce")
+            metric_left, metric_mid, metric_right = st.columns(3)
+            metric_left.metric("10日净流入板块", int((ten_day_values > 0).sum()))
+            metric_mid.metric("10日净流出板块", int((ten_day_values < 0).sum()))
+            metric_right.metric("样本板块数", int(len(ten_day_df)))
+
+            left_col, right_col = st.columns([1.05, 1.35])
+            ten_day_table = display_ten_day_df[[column for column in ["行业", ten_day_value_column, "流入资金", "流出资金", "阶段涨跌幅", "公司家数"] if column in display_ten_day_df.columns]].copy()
+            if ten_day_value_column in ten_day_table.columns:
+                ten_day_table[ten_day_value_column] = ten_day_table[ten_day_value_column].map(lambda value: f"{float(value):.2f} 亿" if pd.notna(value) else "-")
+            for column in ["流入资金", "流出资金"]:
+                if column in ten_day_table.columns:
+                    ten_day_table[column] = ten_day_table[column].map(lambda value: f"{float(value):.2f} 亿" if pd.notna(value) else "-")
+            if "阶段涨跌幅" in ten_day_table.columns:
+                ten_day_table["阶段涨跌幅"] = ten_day_table["阶段涨跌幅"].map(format_percent_value)
+            ten_day_table = ten_day_table.rename(columns={"行业": "板块", ten_day_value_column: "10日净额", "流入资金": "10日流入资金", "流出资金": "10日流出资金", "阶段涨跌幅": "10日涨跌幅", "公司家数": "公司家数"})
+            left_col.caption("近 10 日累计净额前 5 / 后 5")
+            left_col.dataframe(ten_day_table, width="stretch", hide_index=True)
+            chart_df = display_ten_day_df[["行业", ten_day_value_column]].rename(columns={ten_day_value_column: "净额"})
+            right_col.plotly_chart(build_sector_fund_flow_figure(chart_df, "近 10 日板块累计净额"), width="stretch")
+            if ten_day_error:
+                st.caption(f"接口提示：{ten_day_error}")
+
+            sector_blocks, sector_errors = build_top_sector_stock_candidates(ten_day_df.rename(columns={ten_day_value_column: "净额"}) if ten_day_value_column != "净额" else ten_day_df, st.session_state.get("scan_df", pd.DataFrame()), CONFIG_PATH, compute_config_fingerprint(CONFIG_PATH))
+            st.divider()
+            st.caption("10 日资金流入前三板块，各列出 5 支评分更高的股票。优先复用扫描缓存评分，不足部分再即时补算。")
+            if not sector_blocks:
+                st.info("当前还没拿到可展示的板块高评分股票列表。")
+            for sector_block in sector_blocks:
+                metric_col1, metric_col2 = st.columns(2)
+                metric_col1.metric(f"{sector_block['sector_name']} 10日净额", f"{float(sector_block['sector_net_inflow']):.2f} 亿" if pd.notna(sector_block.get("sector_net_inflow")) else "-")
+                metric_col2.metric(f"{sector_block['sector_name']} 10日涨跌幅", format_percent_value(sector_block.get("sector_return_10d")) if pd.notna(sector_block.get("sector_return_10d")) else "-")
+                display_stock_df = sector_block["stocks"][[column for column in ["symbol", "name", "score", "action", "close", "volume_ratio", "rsi", "date", "source"] if column in sector_block["stocks"].columns]].copy()
+                if "score" in display_stock_df.columns:
+                    display_stock_df["score"] = display_stock_df["score"].map(format_score_value)
+                for column in ["close", "volume_ratio", "rsi"]:
+                    if column in display_stock_df.columns:
+                        display_stock_df[column] = display_stock_df[column].map(format_two_decimals)
+                if "date" in display_stock_df.columns:
+                    display_stock_df["date"] = pd.to_datetime(display_stock_df["date"], errors="coerce").map(lambda value: value.strftime("%Y-%m-%d") if pd.notna(value) else "-")
+                display_stock_df = display_stock_df.rename(columns={"symbol": "代码", "name": "名称", "score": "评分", "action": "动作", "close": "最新收盘", "volume_ratio": "量比", "rsi": "RSI", "date": "信号日期", "source": "评分来源"})
+                st.dataframe(display_stock_df, width="stretch", hide_index=True)
+            if sector_errors:
+                for error_text in sector_errors:
+                    st.caption(error_text)
+
+
 def build_market_outlook(scan_df: pd.DataFrame, market_overview: dict[str, object]) -> dict[str, object]:
     if scan_df.empty:
         return {
@@ -1525,6 +1920,115 @@ def cached_snapshot_dataframe(refresh_token: int) -> pd.DataFrame:
             snapshot_df.attrs["snapshot_source_note"] = snapshot_path.name
             return snapshot_df
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_sector_fund_flow(period: str) -> tuple[pd.DataFrame, str | None]:
+    period_map = {
+        "即时": "即时",
+        "今日": "即时",
+        "3日": "3日排行",
+        "5日": "5日排行",
+        "10日": "10日排行",
+        "20日": "20日排行",
+    }
+    target_period = period_map.get(period, period)
+
+    try:
+        sector_df = fetch_ths_sector_fund_flow(target_period)
+    except Exception as error:
+        return pd.DataFrame(), str(error)
+
+    if sector_df is None or sector_df.empty:
+        return pd.DataFrame(), "板块资金流接口返回空结果"
+
+    result = sector_df.copy()
+    numeric_columns = [
+        "行业指数",
+        "行业-涨跌幅",
+        "流入资金",
+        "流出资金",
+        "净额",
+        "公司家数",
+        "领涨股-涨跌幅",
+        "当前价",
+        "阶段涨跌幅",
+    ]
+    for column in numeric_columns:
+        if column in result.columns:
+            result[column] = pd.to_numeric(result[column], errors="coerce")
+    if "行业" in result.columns:
+        result["行业"] = result["行业"].astype(str).str.strip()
+    return result, None
+
+
+def fetch_ths_sector_fund_flow(period: str) -> pd.DataFrame:
+    period_url_map = {
+        "即时": "http://data.10jqka.com.cn/funds/hyzjl/field/tradezdf/order/desc/page/{page}/ajax/1/free/1/",
+        "3日排行": "http://data.10jqka.com.cn/funds/hyzjl/board/3/field/tradezdf/order/desc/page/{page}/ajax/1/free/1/",
+        "5日排行": "http://data.10jqka.com.cn/funds/hyzjl/board/5/field/tradezdf/order/desc/page/{page}/ajax/1/free/1/",
+        "10日排行": "http://data.10jqka.com.cn/funds/hyzjl/board/10/field/tradezdf/order/desc/page/{page}/ajax/1/free/1/",
+        "20日排行": "http://data.10jqka.com.cn/funds/hyzjl/board/20/field/tradezdf/order/desc/page/{page}/ajax/1/free/1/",
+    }
+    target_url = period_url_map.get(period)
+    if not target_url:
+        raise ValueError(f"不支持的板块资金流周期: {period}")
+
+    js_code = py_mini_racer.MiniRacer()
+    js_code.eval(_get_file_content_ths("ths.js"))
+    v_code = js_code.call("v")
+    headers = {
+        "Accept": "text/html, */*; q=0.01",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "hexin-v": v_code,
+        "Host": "data.10jqka.com.cn",
+        "Pragma": "no-cache",
+        "Referer": "http://data.10jqka.com.cn/funds/hyzjl/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    first_response = requests.get(target_url.format(page=1), headers=headers, timeout=20)
+    first_response.raise_for_status()
+    soup = BeautifulSoup(first_response.text, features="lxml")
+    page_info = soup.find(name="span", attrs={"class": "page_info"})
+    total_pages = int(page_info.text.split("/")[1]) if page_info and "/" in page_info.text else 1
+
+    tables: list[pd.DataFrame] = []
+    for page in range(1, total_pages + 1):
+        if page == 1:
+            response = first_response
+        else:
+            response = requests.get(target_url.format(page=page), headers=headers, timeout=20)
+            response.raise_for_status()
+        page_tables = pd.read_html(StringIO(response.text))
+        if not page_tables:
+            continue
+        tables.append(page_tables[0])
+
+    if not tables:
+        return pd.DataFrame()
+
+    raw_df = pd.concat(tables, ignore_index=True)
+    raw_df.columns = [re.sub(r"\s+", "", str(column)).strip() for column in raw_df.columns]
+    rename_map = {
+        "涨跌幅": "行业-涨跌幅",
+        "涨跌幅.1": "领涨股-涨跌幅",
+        "流入资金(亿)": "流入资金",
+        "流出资金(亿)": "流出资金",
+        "净额(亿)": "净额",
+        "当前价(元)": "当前价",
+    }
+    result = raw_df.rename(columns=rename_map)
+    if "序号" in result.columns:
+        result["序号"] = pd.to_numeric(result["序号"], errors="coerce")
+    for column in ["行业-涨跌幅", "领涨股-涨跌幅", "阶段涨跌幅"]:
+        if column in result.columns:
+            result[column] = result[column].astype(str).str.replace("%", "", regex=False)
+    return result
 
 
 def normalize_fund_rank_dataframe(fund_df: pd.DataFrame) -> pd.DataFrame:
@@ -3916,6 +4420,8 @@ def render_market_overview_section(config_path: str, config_fingerprint: str, sc
             stat3.metric("近5日", format_percent_value((market_overview.get("index_return_5d") or 0) * 100) if isinstance(market_overview.get("index_return_5d"), (int, float)) else "-")
             stat4.metric("近10日", format_percent_value((market_overview.get("index_return_10d") or 0) * 100) if isinstance(market_overview.get("index_return_10d"), (int, float)) else "-")
             stat_col.caption("图中黑线为基准指数，橙线/蓝线分别为 MA20 和 MA60，用于辅助判断当前是趋势上移还是高位震荡。")
+
+        render_sector_fund_flow_section()
 
 
 def render_symbol_section(
