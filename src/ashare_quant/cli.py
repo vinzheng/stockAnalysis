@@ -255,12 +255,19 @@ def build_candidate_pool(snapshot: pd.DataFrame, market: dict[str, object]) -> p
     ].copy()
 
     min_turnover_rate = float(market.get("min_turnover_rate", 0) or 0)
+    turnover_filter_applied = False
     if min_turnover_rate > 0 and "turnover_rate" in filtered_snapshot.columns:
-        filtered_snapshot["turnover_rate"] = pd.to_numeric(filtered_snapshot["turnover_rate"], errors="coerce").fillna(0.0)
-        filtered_snapshot = filtered_snapshot.loc[filtered_snapshot["turnover_rate"] >= min_turnover_rate].copy()
+        turnover_rate = pd.to_numeric(filtered_snapshot["turnover_rate"], errors="coerce")
+        if turnover_rate.notna().any():
+            filtered_snapshot["turnover_rate"] = turnover_rate.fillna(0.0)
+            filtered_snapshot = filtered_snapshot.loc[filtered_snapshot["turnover_rate"] >= min_turnover_rate].copy()
+            turnover_filter_applied = True
+        else:
+            filtered_snapshot["turnover_rate"] = turnover_rate
 
     selection_mode = str(market.get("candidate_selection_mode", "turnover_amount")).strip().lower()
     if filtered_snapshot.empty:
+        filtered_snapshot.attrs["turnover_filter_applied"] = turnover_filter_applied
         return filtered_snapshot
 
     if selection_mode == "turnover_amount":
@@ -283,10 +290,12 @@ def build_candidate_pool(snapshot: pd.DataFrame, market: dict[str, object]) -> p
             + pct_change_rank * float(weights.get("pct_change_abs", 0.10))
         )
 
-    return filtered_snapshot.sort_values(
+    filtered_snapshot = filtered_snapshot.sort_values(
         ["candidate_pool_score", "turnover_amount"],
         ascending=[False, False],
     )
+    filtered_snapshot.attrs["turnover_filter_applied"] = turnover_filter_applied
+    return filtered_snapshot
 
 
 def evaluate_index_regime(client: MarketDataClient, config: dict, end_date: datetime) -> tuple[int | None, str, str]:
@@ -469,7 +478,7 @@ def scan_market(config_path: str, as_of: str | None, top: int | None, allow_stal
             if history.empty or len(history) < config["strategy"]["ma_slow"]:
                 processed_candidates += 1
                 continue
-            signal_history = add_signal_columns(history, config)
+            signal_history = add_signal_columns(history, config, symbol=item.symbol)
             summary = latest_signal_summary(signal_history, config)
             if not summary:
                 processed_candidates += 1
@@ -544,6 +553,8 @@ def preheat_history_cache(
     scan_cfg = config["scan"]
 
     client = MarketDataClient(Path("data"))
+    target_date = resolve_scan_target_date(as_of)
+    turnover_cache_status = client.warm_turnover_rate_cache(target_date)
     candidates = load_scan_candidates(client, market)
     if limit is not None:
         candidates = candidates.head(limit)
@@ -579,6 +590,13 @@ def preheat_history_cache(
         f"preheat_done target_date={end_date:%Y-%m-%d} requested={len(candidates)} "
         f"warmed={warmed} failed={failed} max_cache_lag={max_cache_lag}"
     )
+    summary = (
+        f"{summary}\nturnover_cache_status={turnover_cache_status.get('status')} "
+        f"source={turnover_cache_status.get('source')} trade_date={turnover_cache_status.get('trade_date')} "
+        f"nonnull_turnover_rate={turnover_cache_status.get('nonnull_turnover_rate', 0)}"
+    )
+    if turnover_cache_status.get("status") == "failed":
+        summary = f"{summary} error={turnover_cache_status.get('error_type')}: {turnover_cache_status.get('error')}"
     if warmed_symbols:
         summary = f"{summary}\nwarmed_symbols={','.join(warmed_symbols[:20])}"
     if failed_symbols:
@@ -594,7 +612,7 @@ def run_backtest(config_path: str, symbol: str, start: str, end: str | None) -> 
     if history.empty:
         return f"{symbol} 没有获取到历史数据"
 
-    signal_history = add_signal_columns(history, config)
+    signal_history = add_signal_columns(history, config, symbol=symbol)
     result = run_single_symbol_backtest(signal_history, symbol, config["strategy"]["atr_stop_multiple"])
     return (
         f"symbol={result.symbol} trades={result.trades} win_rate={result.win_rate:.2%} "

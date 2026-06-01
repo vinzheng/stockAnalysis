@@ -76,6 +76,7 @@ SNAPSHOT_REQUIRED_COLUMNS = ["代码", "名称", "最新价", "成交额"]
 SNAPSHOT_OPTIONAL_COLUMNS = ["换手率", "涨跌幅", "振幅"]
 SNAPSHOT_CACHE_NAME = "latest_snapshot.csv"
 ACTIVE_SNAPSHOT_CACHE_NAME = "latest_snapshot_active.csv"
+TUSHARE_DAILY_BASIC_CACHE_PATTERN = "tushare_daily_basic_*.csv"
 EFINANCE_ADJUST_MAP = {"hfq": 2, "qfq": 1, "": 0, None: 0, "none": 0}
 HISTORY_CACHE_FILE_PATTERN = re.compile(r"^(?:benchmark_[a-z0-9]+_\d{8}_\d{8}|(?:sh|sz|bj)?[a-z0-9]+_\d{8}_\d{8}_[^.]+)\.csv$", re.IGNORECASE)
 SNAPSHOT_COLUMN_ALIASES = {
@@ -228,6 +229,9 @@ class MarketDataClient:
 
     def _active_snapshot_cache_path(self) -> Path:
         return self.cache_dir / ACTIVE_SNAPSHOT_CACHE_NAME
+
+    def _tushare_daily_basic_cache_path(self, trade_date: date) -> Path:
+        return self.cache_dir / f"tushare_daily_basic_{trade_date:%Y%m%d}.csv"
 
     def _count_trading_day_lag(self, cached_date: date | None, target_date: date) -> int | None:
         if cached_date is None:
@@ -577,6 +581,124 @@ class MarketDataClient:
             self._tushare_client = ts.pro_api(token)
         return self._tushare_client
 
+    def _latest_completed_trading_day(self, reference: datetime | None = None) -> date:
+        current = pd.Timestamp(reference or datetime.now())
+        if current.weekday() >= 5:
+            return (current - BDay(1)).date()
+        if current.hour < 16:
+            return (current - BDay(1)).date()
+        return current.date()
+
+    def _candidate_turnover_trade_dates(self, target_date: date | None = None) -> list[date]:
+        base_date = target_date or self._latest_completed_trading_day()
+        candidate_dates = [base_date]
+        fallback_date = (pd.Timestamp(base_date) - BDay(1)).date()
+        if fallback_date not in candidate_dates:
+            candidate_dates.append(fallback_date)
+        return candidate_dates
+
+    def _normalize_tushare_daily_basic(self, daily_basic: pd.DataFrame) -> pd.DataFrame:
+        if daily_basic is None or daily_basic.empty:
+            return pd.DataFrame(columns=["symbol", "turnover_rate"])
+
+        result = daily_basic.copy()
+        if "ts_code" not in result.columns:
+            return pd.DataFrame(columns=["symbol", "turnover_rate"])
+
+        result["symbol"] = result["ts_code"].map(self._normalize_snapshot_symbol)
+        primary_turnover = pd.to_numeric(result.get("turnover_rate"), errors="coerce")
+        float_turnover = pd.to_numeric(result.get("turnover_rate_f"), errors="coerce")
+        result["turnover_rate"] = primary_turnover.where(primary_turnover.notna(), float_turnover)
+        result = result[["symbol", "turnover_rate"]].copy()
+        result["turnover_rate"] = pd.to_numeric(result["turnover_rate"], errors="coerce")
+        return result.dropna(subset=["symbol"]).drop_duplicates(subset=["symbol"], keep="first")
+
+    def _get_tushare_daily_basic_for_trade_date(self, trade_date: date) -> pd.DataFrame:
+        cache_path = self._tushare_daily_basic_cache_path(trade_date)
+        if cache_path.exists():
+            cached = pd.read_csv(cache_path, dtype={"symbol": "string"})
+            if "symbol" in cached.columns:
+                cached["symbol"] = cached["symbol"].map(self._normalize_snapshot_symbol)
+            if "turnover_rate" in cached.columns:
+                cached["turnover_rate"] = pd.to_numeric(cached["turnover_rate"], errors="coerce")
+            return cached
+
+        client = self._get_tushare_client()
+        daily_basic = self._with_retry(
+            f"fetch tushare daily_basic for {trade_date:%Y%m%d}",
+            lambda: client.daily_basic(trade_date=trade_date.strftime("%Y%m%d")),
+        )
+        normalized = self._normalize_tushare_daily_basic(daily_basic)
+        if not normalized.empty:
+            normalized.to_csv(cache_path, index=False, encoding="utf-8-sig")
+        return normalized
+
+    def _supplement_snapshot_turnover_rate(self, snapshot: pd.DataFrame) -> pd.DataFrame:
+        if snapshot.empty or "turnover_rate" not in snapshot.columns:
+            return snapshot
+
+        turnover_rate = pd.to_numeric(snapshot["turnover_rate"], errors="coerce")
+        if turnover_rate.notna().any():
+            return snapshot
+
+        supplemented = snapshot.copy()
+        for trade_date in self._candidate_turnover_trade_dates():
+            try:
+                daily_basic = self._get_tushare_daily_basic_for_trade_date(trade_date)
+            except Exception:
+                continue
+            if daily_basic.empty:
+                continue
+
+            supplemented = supplemented.merge(
+                daily_basic,
+                on="symbol",
+                how="left",
+                suffixes=("", "_tushare"),
+            )
+            missing_mask = pd.to_numeric(supplemented["turnover_rate"], errors="coerce").isna()
+            supplemented.loc[missing_mask, "turnover_rate"] = supplemented.loc[missing_mask, "turnover_rate_tushare"]
+            supplemented = supplemented.drop(columns=["turnover_rate_tushare"])
+            if pd.to_numeric(supplemented["turnover_rate"], errors="coerce").notna().any():
+                self._set_fetch_detail("snapshot_turnover", "tushare_daily_basic", trade_date.isoformat())
+                return supplemented
+
+        return snapshot
+
+    def warm_turnover_rate_cache(self, target_date: date | None = None) -> dict[str, object]:
+        last_error: Exception | None = None
+        for trade_date in self._candidate_turnover_trade_dates(target_date):
+            cache_path = self._tushare_daily_basic_cache_path(trade_date)
+            used_cache = cache_path.exists()
+            try:
+                daily_basic = self._get_tushare_daily_basic_for_trade_date(trade_date)
+            except Exception as error:
+                last_error = error
+                continue
+
+            nonnull_turnover = int(pd.to_numeric(daily_basic.get("turnover_rate"), errors="coerce").notna().sum()) if "turnover_rate" in daily_basic.columns else 0
+            if nonnull_turnover > 0:
+                return {
+                    "status": "ready",
+                    "trade_date": trade_date.isoformat(),
+                    "rows": len(daily_basic),
+                    "nonnull_turnover_rate": nonnull_turnover,
+                    "source": "cache" if used_cache else "tushare_daily_basic",
+                }
+
+        if last_error is None:
+            return {"status": "empty", "trade_date": None, "rows": 0, "nonnull_turnover_rate": 0, "source": "none"}
+
+        return {
+            "status": "failed",
+            "trade_date": None,
+            "rows": 0,
+            "nonnull_turnover_rate": 0,
+            "source": "none",
+            "error_type": type(last_error).__name__,
+            "error": str(last_error),
+        }
+
     def _normalize_tushare_history(self, history: pd.DataFrame, *, is_index: bool = False) -> pd.DataFrame:
         if history is None or history.empty:
             return pd.DataFrame()
@@ -767,6 +889,8 @@ class MarketDataClient:
                             return cached_snapshot
                     raise
 
+        snapshot = self._supplement_snapshot_turnover_rate(snapshot)
+
         if _has_active_snapshot_activity(snapshot):
             snapshot.to_csv(cache_path, index=False, encoding="utf-8-sig")
             snapshot.to_csv(active_cache_path, index=False, encoding="utf-8-sig")
@@ -867,11 +991,13 @@ class MarketDataClient:
             cached_history = self._load_cached_history(cache_path)
             if not cached_history.empty and cached_history["date"].max() >= pd.Timestamp(end_date.date()):
                 self._set_fetch_detail("history", "cache", cache_path.name)
+                cached_history.attrs["symbol"] = normalized_symbol
                 return cached_history
             if not cached_history.empty and max_cache_trading_day_lag > 0:
                 trading_day_lag = self._count_trading_day_lag(cached_history["date"].max().date(), end_date.date())
                 if trading_day_lag is not None and trading_day_lag <= max_cache_trading_day_lag:
                     self._set_fetch_detail("history", "cache", cache_path.name)
+                    cached_history.attrs["symbol"] = normalized_symbol
                     return cached_history
         elif use_cache and max_cache_trading_day_lag > 0:
             reusable_cache = self._find_reusable_history_cache(
@@ -883,17 +1009,11 @@ class MarketDataClient:
             )
             if reusable_cache is not None:
                 self._set_fetch_detail("history", "cache", "reusable")
+                reusable_cache.attrs["symbol"] = normalized_symbol
                 return reusable_cache
 
-        # Priority: tushare -> efinance -> akshare_daily -> akshare_hist -> baostock last-resort fallback
+        # Priority: akshare_daily -> efinance -> akshare_hist -> tushare -> baostock last-resort fallback
         try:
-            try:
-                history = self._get_history_from_tushare(normalized_symbol, start_date, end_date, adjust)
-                self._set_fetch_detail("history", "tushare")
-            except Exception:
-                history = self._get_history_from_efinance(normalized_symbol, start_date, end_date, adjust)
-                self._set_fetch_detail("history", "efinance")
-        except Exception:
             try:
                 history = self._with_retry(
                     f"fetch fallback history for {normalized_symbol}",
@@ -905,19 +1025,26 @@ class MarketDataClient:
                 ].reset_index(drop=True)
                 self._set_fetch_detail("history", "akshare_daily")
             except Exception:
+                history = self._get_history_from_efinance(normalized_symbol, start_date, end_date, adjust)
+                self._set_fetch_detail("history", "efinance")
+        except Exception:
+            try:
+                history = self._with_retry(
+                    f"fetch history for {normalized_symbol}",
+                    lambda: ak.stock_zh_a_hist(
+                        symbol=normalized_symbol,
+                        period="daily",
+                        start_date=start_date.strftime("%Y%m%d"),
+                        end_date=end_date.strftime("%Y%m%d"),
+                        adjust=adjust,
+                    ),
+                )
+                history = self._normalize_history(history, HISTORY_COLUMN_MAP)
+                self._set_fetch_detail("history", "akshare_hist")
+            except Exception:
                 try:
-                    history = self._with_retry(
-                        f"fetch history for {normalized_symbol}",
-                        lambda: ak.stock_zh_a_hist(
-                            symbol=normalized_symbol,
-                            period="daily",
-                            start_date=start_date.strftime("%Y%m%d"),
-                            end_date=end_date.strftime("%Y%m%d"),
-                            adjust=adjust,
-                        ),
-                    )
-                    history = self._normalize_history(history, HISTORY_COLUMN_MAP)
-                    self._set_fetch_detail("history", "akshare_hist")
+                    history = self._get_history_from_tushare(normalized_symbol, start_date, end_date, adjust)
+                    self._set_fetch_detail("history", "tushare")
                 except Exception:
                     history = self._get_history_from_baostock(normalized_symbol, start_date, end_date, adjust)
                     self._set_fetch_detail("history", "baostock")
@@ -925,6 +1052,7 @@ class MarketDataClient:
         if history.empty:
             return history
         history.to_csv(cache_path, index=False, encoding="utf-8-sig")
+        history.attrs["symbol"] = normalized_symbol
         return history
 
 

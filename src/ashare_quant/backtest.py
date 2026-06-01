@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from ashare_quant.strategy import get_breakout_chase_limit_pct, get_entry_weak_open_limit_pct
+from ashare_quant.strategy import get_breakout_chase_limit_pct, get_entry_weak_open_limit_pct, get_board_limit_ratio
 
 
 @dataclass(slots=True)
@@ -151,9 +151,14 @@ def run_single_symbol_backtest(history: pd.DataFrame, symbol: str, atr_stop_mult
             execution_basis="next_open",
         )
 
+    # 计算板块涨跌幅限制和相关比例调整系数
+    limit_ratio = get_board_limit_ratio(symbol)
+    scale_factor = limit_ratio / 0.10
+
     cash = 1.0
     position = 0.0
     entry_price = math.nan
+    cash_before_entry = math.nan
     trade_returns: list[float] = []
     equity_curve: list[float] = []
     pending_entry = False
@@ -161,16 +166,30 @@ def run_single_symbol_backtest(history: pd.DataFrame, symbol: str, atr_stop_mult
     pending_entry_type = ""
     pending_breakout_high = math.nan
     pending_signal_close = math.nan
-    breakout_chase_limit_pct = 0.04
-    entry_weak_open_limit_pct = 0.005
+    
+    breakout_chase_limit_pct = 0.04 * scale_factor
+    entry_weak_open_limit_pct = 0.005 * scale_factor
     if "breakout_chase_limit_pct" in history.attrs:
         breakout_chase_limit_pct = float(history.attrs["breakout_chase_limit_pct"])
     elif "config" in history.attrs:
-        breakout_chase_limit_pct = get_breakout_chase_limit_pct(history.attrs["config"])
+        breakout_chase_limit_pct = get_breakout_chase_limit_pct(history.attrs["config"]) * scale_factor
     if "entry_weak_open_limit_pct" in history.attrs:
         entry_weak_open_limit_pct = float(history.attrs["entry_weak_open_limit_pct"])
     elif "config" in history.attrs:
-        entry_weak_open_limit_pct = get_entry_weak_open_limit_pct(history.attrs["config"])
+        entry_weak_open_limit_pct = get_entry_weak_open_limit_pct(history.attrs["config"]) * scale_factor
+
+    # 从配置信息中动态抽取交易摩擦与成本(滑点、佣金、印花税)
+    strategy_cfg = {}
+    if "config" in history.attrs and history.attrs["config"]:
+        strategy_cfg = history.attrs["config"].get("strategy", {}) or {}
+    elif hasattr(history, "attrs") and "strategy" in history.attrs:
+        strategy_cfg = history.attrs["strategy"] or {}
+
+    slippage_pct = float(strategy_cfg.get("slippage_pct", 0.001))        # 默认 0.1% 滑点成本
+    commission_rate = float(strategy_cfg.get("commission_rate", 0.0003)) # 默认万分之三券商佣金
+    stamp_duty_rate = float(strategy_cfg.get("stamp_duty_rate", 0.0005)) # 默认万分之五印花税 (卖方单边收取)
+
+    prev_close = math.nan
 
     for row in history.itertuples(index=False):
         open_price = float(row.open)
@@ -178,38 +197,57 @@ def run_single_symbol_backtest(history: pd.DataFrame, symbol: str, atr_stop_mult
         buy_signal = bool(row.buy_signal)
         sell_signal = bool(row.sell_signal)
 
+        # 估算涨停和跌停边界价格（基于昨日收盘价）
+        limit_up_price = math.nan
+        limit_down_price = math.nan
+        if not math.isnan(prev_close):
+            limit_up_price = round(prev_close * (1 + limit_ratio), 2)
+            limit_down_price = round(prev_close * (1 - limit_ratio), 2)
+
         if pending_exit and position > 0:
-            cash = position * open_price
-            trade_returns.append((open_price / entry_price) - 1)
-            position = 0.0
-            entry_price = math.nan
-            pending_exit = False
+            # 跌停限制：如果当天开盘价锁死在跌停价或更低，则今日无法成交卖出，保留 pending_exit 继续持有
+            if not math.isnan(limit_down_price) and open_price <= limit_down_price:
+                pass
+            else:
+                sell_exec_price = open_price * (1 - slippage_pct)
+                cash = position * sell_exec_price * (1 - commission_rate - stamp_duty_rate)
+                trade_returns.append((cash / cash_before_entry) - 1 if not math.isnan(cash_before_entry) else (sell_exec_price / entry_price) - 1)
+                position = 0.0
+                entry_price = math.nan
+                cash_before_entry = math.nan
+                pending_exit = False
 
         if pending_entry and position == 0:
-            skip_breakout_entry = (
-                pending_entry_type == "突破买入"
-                and not math.isnan(pending_breakout_high)
-                and open_price > pending_breakout_high * (1 + breakout_chase_limit_pct)
-            )
-            skip_weak_open_entry = (
-                not math.isnan(pending_signal_close)
-                and (
-                    open_price < pending_signal_close * (1 - entry_weak_open_limit_pct)
-                    or (
-                        pending_entry_type == "突破买入"
-                        and not math.isnan(pending_breakout_high)
-                        and open_price < pending_breakout_high * (1 - entry_weak_open_limit_pct)
+            # 涨停限制：如果当天开盘价锁死在涨停价或更高，则今日无法买入成交，保留 pending_entry 继续观望
+            if not math.isnan(limit_up_price) and open_price >= limit_up_price:
+                pass
+            else:
+                skip_breakout_entry = (
+                    pending_entry_type == "突破买入"
+                    and not math.isnan(pending_breakout_high)
+                    and open_price > pending_breakout_high * (1 + breakout_chase_limit_pct)
+                )
+                skip_weak_open_entry = (
+                    not math.isnan(pending_signal_close)
+                    and (
+                        open_price < pending_signal_close * (1 - entry_weak_open_limit_pct)
+                        or (
+                            pending_entry_type == "突破买入"
+                            and not math.isnan(pending_breakout_high)
+                            and open_price < pending_breakout_high * (1 - entry_weak_open_limit_pct)
+                        )
                     )
                 )
-            )
-            pending_entry = False
-            if not (skip_breakout_entry or skip_weak_open_entry):
-                position = cash / open_price
-                cash = 0.0
-                entry_price = open_price
-            pending_entry_type = ""
-            pending_breakout_high = math.nan
-            pending_signal_close = math.nan
+                pending_entry = False
+                if not (skip_breakout_entry or skip_weak_open_entry):
+                    cash_before_entry = cash
+                    buy_exec_price = open_price * (1 + slippage_pct)
+                    position = (cash / (1 + commission_rate)) / buy_exec_price
+                    cash = 0.0
+                    entry_price = buy_exec_price
+                pending_entry_type = ""
+                pending_breakout_high = math.nan
+                pending_signal_close = math.nan
 
         if position > 0:
             if sell_signal:
@@ -223,11 +261,13 @@ def run_single_symbol_backtest(history: pd.DataFrame, symbol: str, atr_stop_mult
 
         equity = cash if position == 0 else position * close
         equity_curve.append(equity)
+        prev_close = close
 
     if position > 0:
         final_close = float(history.iloc[-1]["close"])
-        cash = position * final_close
-        trade_returns.append((final_close / entry_price) - 1)
+        sell_exec_price = final_close * (1 - slippage_pct)
+        cash = position * sell_exec_price * (1 - commission_rate - stamp_duty_rate)
+        trade_returns.append((cash / cash_before_entry) - 1 if not math.isnan(cash_before_entry) else (sell_exec_price / entry_price) - 1)
         equity_curve[-1] = cash
 
     equity_series = pd.Series(equity_curve, dtype=float)

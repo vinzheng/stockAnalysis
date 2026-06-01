@@ -4,6 +4,28 @@ import numpy as np
 import pandas as pd
 
 
+def get_board_limit_ratio(symbol: str) -> float:
+    """
+    根据 A 股代码前缀识别板块，返回标准涨跌幅限制比率：
+    - 科创板 (sh688... / 688...): 0.20
+    - 创业板 (sz30... / 300... / 301...): 0.20
+    - 北交所 (bj... / 43... / 83... / 87... / 88... / 92...): 0.30
+    - 沪深主板: 0.10
+    """
+    symbol = str(symbol).lower().strip()
+    code = "".join(filter(str.isdigit, symbol))
+    if not code:
+        return 0.10
+
+    if "sh688" in symbol or code.startswith("688"):
+        return 0.20
+    if "sz300" in symbol or "sz301" in symbol or code.startswith(("300", "301")):
+        return 0.20
+    if "bj" in symbol or code.startswith(("43", "83", "87", "88", "92")):
+        return 0.30
+    return 0.10
+
+
 def get_breakout_chase_limit_pct(config: dict | None) -> float:
     if not config:
         return 0.04
@@ -65,10 +87,19 @@ def enrich_indicators(history: pd.DataFrame, config: dict) -> pd.DataFrame:
     return result
 
 
-def apply_position_state_machine(history: pd.DataFrame, config: dict) -> pd.DataFrame:
+def apply_position_state_machine(history: pd.DataFrame, config: dict, symbol: str | None = None) -> pd.DataFrame:
+    if symbol is None:
+        symbol = history.attrs.get("symbol", "")
+    limit_ratio = get_board_limit_ratio(symbol)
+    scale_factor = limit_ratio / 0.10
+
     atr_stop_multiple = float(config["strategy"].get("atr_stop_multiple", 0))
-    breakout_chase_limit_pct = get_breakout_chase_limit_pct(config)
-    entry_weak_open_limit_pct = get_entry_weak_open_limit_pct(config)
+    enable_trailing_stop = bool(config["strategy"].get("enable_trailing_stop", True))
+    atr_profit_activation_multiple = float(config["strategy"].get("atr_profit_activation_multiple", 0))
+    atr_profit_retracement_multiple = float(config["strategy"].get("atr_profit_retracement_multiple", 0))
+
+    breakout_chase_limit_pct = get_breakout_chase_limit_pct(config) * scale_factor
+    entry_weak_open_limit_pct = get_entry_weak_open_limit_pct(config) * scale_factor
     result = history.copy()
 
     effective_buy_signal: list[bool] = []
@@ -95,52 +126,112 @@ def apply_position_state_machine(history: pd.DataFrame, config: dict) -> pd.Data
     pending_breakout_high = np.nan
     pending_signal_close = np.nan
 
+    # === Phase 3 dynamic trackers ===
+    max_close_since_entry = np.nan
+    profit_protect_activated = False
+
+    prev_close = np.nan
+
     for index, row in enumerate(result.itertuples(index=False)):
         row_open = float(row.open)
         row_close = float(row.close)
         row_atr = float(row.atr) if pd.notna(row.atr) else np.nan
 
+        # 估算涨停和跌停边界价格（基于昨日收盘价）
+        limit_up_price = np.nan
+        limit_down_price = np.nan
+        if pd.notna(prev_close):
+            limit_up_price = round(prev_close * (1 + limit_ratio), 2)
+            limit_down_price = round(prev_close * (1 - limit_ratio), 2)
+
         if pending_exit and in_position:
-            in_position = False
-            pending_exit = False
-            entry_price = np.nan
-            entry_atr = np.nan
-            entry_index = None
-            active_entry_type = ""
+            # 跌停限制：如果开盘价锁死在跌停板或更低，则今日无法完成卖出平仓，继续持有和等待
+            if pd.notna(limit_down_price) and row_open <= limit_down_price:
+                pass
+            else:
+                in_position = False
+                pending_exit = False
+                entry_price = np.nan
+                entry_atr = np.nan
+                entry_index = None
+                active_entry_type = ""
+                # === Reset Phase 3 trackers ===
+                max_close_since_entry = np.nan
+                profit_protect_activated = False
 
         if pending_entry and not in_position:
-            skip_breakout_entry = (
-                pending_entry_type == "突破买入"
-                and pd.notna(pending_breakout_high)
-                and row_open > float(pending_breakout_high) * (1 + breakout_chase_limit_pct)
-            )
-            skip_weak_open_entry = (
-                pd.notna(pending_signal_close)
-                and (
-                    row_open < float(pending_signal_close) * (1 - entry_weak_open_limit_pct)
-                    or (
-                        pending_entry_type == "突破买入"
-                        and pd.notna(pending_breakout_high)
-                        and row_open < float(pending_breakout_high) * (1 - entry_weak_open_limit_pct)
+            # 涨停限制：如果开盘价锁死在涨停板或更高，则今日无法买入建仓，继续保持等待
+            if pd.notna(limit_up_price) and row_open >= limit_up_price:
+                pass
+            else:
+                skip_breakout_entry = (
+                    pending_entry_type == "突破买入"
+                    and pd.notna(pending_breakout_high)
+                    and row_open > float(pending_breakout_high) * (1 + breakout_chase_limit_pct)
+                )
+                skip_weak_open_entry = (
+                    pd.notna(pending_signal_close)
+                    and (
+                        row_open < float(pending_signal_close) * (1 - entry_weak_open_limit_pct)
+                        or (
+                            pending_entry_type == "突破买入"
+                            and pd.notna(pending_breakout_high)
+                            and row_open < float(pending_breakout_high) * (1 - entry_weak_open_limit_pct)
+                        )
                     )
                 )
-            )
-            pending_entry = False
-            if not (skip_breakout_entry or skip_weak_open_entry):
-                in_position = True
-                entry_price = row_open
-                entry_atr = row_atr
-                entry_index = index
-                active_entry_type = pending_entry_type or str(getattr(row, "raw_buy_signal_type", "") or "")
-            pending_entry_type = ""
-            pending_breakout_high = np.nan
-            pending_signal_close = np.nan
+                pending_entry = False
+                if not (skip_breakout_entry or skip_weak_open_entry):
+                    in_position = True
+                    entry_price = row_open
+                    entry_atr = row_atr
+                    entry_index = index
+                    active_entry_type = pending_entry_type or str(getattr(row, "raw_buy_signal_type", "") or "")
+                    
+                    # === Init Phase 3 trackers ===
+                    max_close_since_entry = row_close
+                    profit_protect_activated = False
+                pending_entry_type = ""
+                pending_breakout_high = np.nan
+                pending_signal_close = np.nan
+
+        # === Update peak close tracking when in position ===
+        if in_position:
+            if pd.isna(max_close_since_entry):
+                max_close_since_entry = row_close
+            else:
+                max_close_since_entry = max(max_close_since_entry, row_close)
 
         current_stop_price = np.nan
         current_atr_stop_signal = False
-        if in_position and pd.notna(entry_price) and pd.notna(entry_atr) and atr_stop_multiple > 0:
-            current_stop_price = entry_price - (atr_stop_multiple * entry_atr)
-            current_atr_stop_signal = bool(row_close <= current_stop_price)
+        current_atr_profit_signal = False
+
+        if in_position and pd.notna(entry_price) and pd.notna(entry_atr):
+            # 1. 动态移动止损
+            if atr_stop_multiple > 0:
+                if enable_trailing_stop and pd.notna(max_close_since_entry):
+                    current_stop_price = max_close_since_entry - (atr_stop_multiple * entry_atr)
+                else:
+                    current_stop_price = entry_price - (atr_stop_multiple * entry_atr)
+                
+                # 止损线只升不降
+                if index > 0 and len(atr_stop_price) > 0:
+                    prev_stop = atr_stop_price[-1]
+                    if pd.notna(prev_stop) and pd.notna(current_stop_price):
+                        current_stop_price = max(current_stop_price, prev_stop)
+                
+                if row_close <= current_stop_price:
+                    current_atr_stop_signal = True
+
+            # 2. ATR自适应保护 / 移动止盈
+            if atr_profit_activation_multiple > 0 and atr_profit_retracement_multiple > 0:
+                if not profit_protect_activated and row_close >= entry_price + (atr_profit_activation_multiple * entry_atr):
+                    profit_protect_activated = True
+                
+                if profit_protect_activated and pd.notna(max_close_since_entry):
+                    profit_protect_price = max_close_since_entry - (atr_profit_retracement_multiple * entry_atr)
+                    if row_close <= profit_protect_price:
+                        current_atr_profit_signal = True
 
         raw_buy_signal = bool(row.buy_signal)
         raw_buy_type = str(row.raw_buy_signal_type or "")
@@ -148,12 +239,17 @@ def apply_position_state_machine(history: pd.DataFrame, config: dict) -> pd.Data
         raw_sell_signal = bool(row.base_sell_signal)
 
         buy_signal = (not in_position) and raw_buy_signal
-        sell_signal = in_position and (raw_sell_signal or current_atr_stop_signal)
+        sell_signal = in_position and (raw_sell_signal or current_atr_stop_signal or current_atr_profit_signal)
         add_on_signal = in_position and raw_add_on_signal and not sell_signal
 
         current_signal_reason = ""
         if sell_signal:
-            current_signal_reason = "ATR止损" if current_atr_stop_signal else str(row.base_sell_reason or "")
+            if current_atr_stop_signal:
+                current_signal_reason = "动态移动止损" if enable_trailing_stop else "固定ATR止损"
+            elif current_atr_profit_signal:
+                current_signal_reason = "ATR自适应止盈"
+            else:
+                current_signal_reason = str(row.base_sell_reason or "")
 
         if sell_signal:
             pending_exit = True
@@ -194,6 +290,8 @@ def apply_position_state_machine(history: pd.DataFrame, config: dict) -> pd.Data
         entry_signal_type.append(raw_buy_type if buy_signal else active_entry_type)
         holding_days.append(float(index - entry_index) if in_position and entry_index is not None else np.nan)
 
+        prev_close = row_close
+
     result["buy_signal"] = pd.Series(effective_buy_signal, index=result.index, dtype=bool)
     result["add_on_signal"] = pd.Series(effective_add_on_signal, index=result.index, dtype=bool)
     result["sell_signal"] = pd.Series(effective_sell_signal, index=result.index, dtype=bool)
@@ -209,7 +307,9 @@ def apply_position_state_machine(history: pd.DataFrame, config: dict) -> pd.Data
     return result
 
 
-def add_signal_columns(history: pd.DataFrame, config: dict) -> pd.DataFrame:
+def add_signal_columns(history: pd.DataFrame, config: dict, symbol: str | None = None) -> pd.DataFrame:
+    if symbol is None:
+        symbol = history.attrs.get("symbol", "")
     strategy = config["strategy"]
     result = enrich_indicators(history, config)
     breakout_score_min, pullback_score_min = get_entry_score_thresholds(config)
@@ -293,9 +393,13 @@ def add_signal_columns(history: pd.DataFrame, config: dict) -> pd.DataFrame:
         & ~result["base_sell_signal"]
     )
     result["score"] = base_score
-    final_result = apply_position_state_machine(result, config)
-    final_result.attrs["breakout_chase_limit_pct"] = get_breakout_chase_limit_pct(config)
-    final_result.attrs["entry_weak_open_limit_pct"] = get_entry_weak_open_limit_pct(config)
+    final_result = apply_position_state_machine(result, config, symbol=symbol)
+    
+    limit_ratio = get_board_limit_ratio(symbol)
+    scale_factor = limit_ratio / 0.10
+    final_result.attrs["breakout_chase_limit_pct"] = get_breakout_chase_limit_pct(config) * scale_factor
+    final_result.attrs["entry_weak_open_limit_pct"] = get_entry_weak_open_limit_pct(config) * scale_factor
+    final_result.attrs["symbol"] = symbol
     return final_result
 
 
@@ -320,8 +424,8 @@ def latest_signal_summary(history: pd.DataFrame, config: dict | None = None) -> 
     entry_signal_type = str(latest.get("entry_signal_type", "") or "")
     execution_advice = "当前没有新的执行信号，继续观察。"
     sell_reason = ""
-    breakout_chase_limit_pct = get_breakout_chase_limit_pct(config)
-    entry_weak_open_limit_pct = get_entry_weak_open_limit_pct(config)
+    breakout_chase_limit_pct = float(history.attrs.get("breakout_chase_limit_pct", get_breakout_chase_limit_pct(config)))
+    entry_weak_open_limit_pct = float(history.attrs.get("entry_weak_open_limit_pct", get_entry_weak_open_limit_pct(config)))
     if action_row is not None:
         if action in {"买入", "补仓", "卖出"}:
             signal_age = int(len(history) - history.index.get_loc(action_row.name) - 1)

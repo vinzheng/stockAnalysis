@@ -554,42 +554,58 @@ def load_best_available_scan_cache(
     allowed_sources: set[str] | None = None,
     max_trading_day_lag: int | None = None,
     reference_date: date | None = None,
-) -> tuple[list[tuple[date | None, int, float, pd.DataFrame, str, bool]], bool]:
+) -> tuple[
+    list[tuple[date | None, int, float, pd.DataFrame, str, bool]],
+    list[tuple[date | None, int, float, pd.DataFrame, str, bool]],
+    bool,
+]:
     existing_files = sorted(
         [(path, source) for path, source in SCAN_FILE_SPECS if path.exists()],
         key=lambda item: item[0].stat().st_mtime,
         reverse=True,
     )
     compatible_scans: list[tuple[date | None, int, float, pd.DataFrame, str, bool]] = []
+    incompatible_scans: list[tuple[date | None, int, float, pd.DataFrame, str, bool]] = []
     found_incompatible_cache = False
     for latest_path, source in existing_files:
         if allowed_sources is not None and source not in allowed_sources:
             continue
         metadata = load_scan_metadata(latest_path)
-        if metadata is not None and metadata.get("config_fingerprint") != config_fingerprint:
-            found_incompatible_cache = True
-            continue
         scan_df = normalize_scan_dataframe(pd.read_csv(latest_path))
         latest_signal_date = get_latest_signal_date(scan_df)
         if max_trading_day_lag is not None:
             trading_day_lag = count_trading_day_lag(latest_signal_date, reference_date)
             if trading_day_lag is None or trading_day_lag > max_trading_day_lag:
                 continue
-        compatible_scans.append(
-            (
-                latest_signal_date,
-                SCAN_SOURCE_PRIORITY.get(source, -1),
-                latest_path.stat().st_mtime,
-                scan_df,
-                source,
-                metadata is None,
-            )
+        scan_item = (
+            latest_signal_date,
+            SCAN_SOURCE_PRIORITY.get(source, -1),
+            latest_path.stat().st_mtime,
+            scan_df,
+            source,
+            metadata is None,
         )
-    return compatible_scans, found_incompatible_cache
+        if metadata is not None and metadata.get("config_fingerprint") != config_fingerprint:
+            found_incompatible_cache = True
+            incompatible_scans.append(scan_item)
+            continue
+        compatible_scans.append(scan_item)
+    return compatible_scans, incompatible_scans, found_incompatible_cache
+
+
+def choose_best_scan_cache(
+    scans: list[tuple[date | None, int, float, pd.DataFrame, str, bool]],
+) -> tuple[date | None, int, float, pd.DataFrame, str, bool] | None:
+    if not scans:
+        return None
+    return max(
+        scans,
+        key=lambda item: (item[0] or date.min, item[1], len(item[3]), item[2]),
+    )
 
 
 def load_latest_scan_from_disk(config_fingerprint: str, requested_date: date | None) -> tuple[pd.DataFrame, str | None, bool, str]:
-    compatible_scans, found_incompatible_cache = load_best_available_scan_cache(config_fingerprint)
+    compatible_scans, incompatible_scans, found_incompatible_cache = load_best_available_scan_cache(config_fingerprint)
     if not compatible_scans and not found_incompatible_cache:
         return pd.DataFrame(), None, True, "none"
 
@@ -600,14 +616,35 @@ def load_latest_scan_from_disk(config_fingerprint: str, requested_date: date | N
     }
 
     if compatible_scans:
-        latest_signal_date, _, _, scan_df, source, is_legacy_cache = max(
-            compatible_scans,
-            key=lambda item: (item[0] or date.min, item[1], item[2]),
-        )
+        best_scan = choose_best_scan_cache(compatible_scans)
+        assert best_scan is not None
+        latest_signal_date, _, _, scan_df, source, is_legacy_cache = best_scan
         status_message = source_messages.get(source)
         if is_legacy_cache:
             legacy_message = "当前展示的是旧版本地缓存结果，可能与当前参数不完全一致。"
             status_message = legacy_message if not status_message else f"{status_message} {legacy_message}"
+        if source == "partial":
+            non_partial_df, non_partial_message, non_partial_ready, non_partial_source = load_latest_non_partial_scan_from_disk(
+                config_fingerprint,
+                requested_date,
+            )
+            if not non_partial_df.empty and len(non_partial_df) > len(scan_df):
+                status_message = "检测到最新扫描仅产出部分结果，已优先展示本地最近一次更完整的扫描缓存。"
+                if non_partial_message:
+                    status_message = f"{status_message} {non_partial_message}"
+                return non_partial_df, status_message, non_partial_ready, non_partial_source
+
+            legacy_non_partial = choose_best_scan_cache(
+                [item for item in incompatible_scans if item[4] in {"complete", "stale"}]
+            )
+            if legacy_non_partial is not None and len(legacy_non_partial[3]) > len(scan_df):
+                legacy_date, _, _, legacy_df, legacy_source, _ = legacy_non_partial
+                status_message = (
+                    "检测到最新扫描仅产出部分结果，已回退展示本地最近一次更完整的历史缓存。"
+                    " 该缓存基于旧参数生成，仅作参考。"
+                )
+                legacy_ready = requested_date is None or (legacy_date is not None and legacy_date >= requested_date)
+                return legacy_df, status_message, legacy_ready, legacy_source
         is_ready = requested_date is None or (latest_signal_date is not None and latest_signal_date >= requested_date)
         if requested_date is not None and latest_signal_date is not None and latest_signal_date < requested_date:
             freshness_message = (
@@ -628,17 +665,16 @@ def load_latest_non_partial_scan_from_disk(
     requested_date: date | None,
 ) -> tuple[pd.DataFrame, str | None, bool, str]:
     reference_date = requested_date or resolve_scan_target_date(None)
-    compatible_scans, found_incompatible_cache = load_best_available_scan_cache(
+    compatible_scans, incompatible_scans, found_incompatible_cache = load_best_available_scan_cache(
         config_fingerprint,
         allowed_sources={"complete", "stale"},
         max_trading_day_lag=NON_PARTIAL_CACHE_MAX_TRADING_DAYS,
         reference_date=reference_date,
     )
     if compatible_scans:
-        latest_signal_date, _, _, scan_df, source, is_legacy_cache = max(
-            compatible_scans,
-            key=lambda item: (item[0] or date.min, item[1], item[2]),
-        )
+        best_scan = choose_best_scan_cache(compatible_scans)
+        assert best_scan is not None
+        latest_signal_date, _, _, scan_df, source, is_legacy_cache = best_scan
         source_messages = {
             "complete": "已回退到本地最近一次完整扫描结果。",
             "stale": "已回退到本地最近一次参考扫描结果。",
@@ -650,7 +686,7 @@ def load_latest_non_partial_scan_from_disk(
         is_ready = requested_date is None or (latest_signal_date is not None and latest_signal_date >= requested_date)
         return scan_df, status_message, is_ready, source
 
-    all_non_partial_scans, _ = load_best_available_scan_cache(
+    all_non_partial_scans, all_incompatible_non_partial_scans, _ = load_best_available_scan_cache(
         config_fingerprint,
         allowed_sources={"complete", "stale"},
     )
@@ -662,6 +698,19 @@ def load_latest_non_partial_scan_from_disk(
             False,
             "none",
         )
+
+    if all_incompatible_non_partial_scans:
+        best_legacy_scan = choose_best_scan_cache(all_incompatible_non_partial_scans)
+        assert best_legacy_scan is not None
+        latest_signal_date, _, _, scan_df, source, _ = best_legacy_scan
+        is_ready = requested_date is None or (latest_signal_date is not None and latest_signal_date >= requested_date)
+        source_messages = {
+            "complete": "已回退到本地最近一次完整扫描结果。",
+            "stale": "已回退到本地最近一次参考扫描结果。",
+        }
+        status_message = source_messages.get(source, "已回退到本地最近一次扫描结果。")
+        status_message = f"{status_message} 该缓存基于旧参数生成，仅作参考。"
+        return scan_df, status_message, is_ready, source
 
     if found_incompatible_cache:
         return pd.DataFrame(), "检测到策略参数已变更，本地扫描缓存已自动失效。", False, "invalidated"
@@ -1884,7 +1933,7 @@ def cached_history(
         history.attrs["history_source_note"] = fetch_detail.get("note", "")
         return history
     config = load_config(config_path)
-    enriched_history = add_signal_columns(history, config)
+    enriched_history = add_signal_columns(history, config, symbol=symbol)
     enriched_history.attrs["history_source"] = fetch_detail.get("source", "")
     enriched_history.attrs["history_source_note"] = fetch_detail.get("note", "")
     return enriched_history
@@ -1903,7 +1952,7 @@ def cached_symbol_snapshot(symbol: str) -> dict[str, object] | None:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def cached_snapshot_dataframe(refresh_token: int) -> pd.DataFrame:
+def cached_snapshot_dataframe(refresh_token: int = 0) -> pd.DataFrame:
     del refresh_token
     client = MarketDataClient(DATA_DIR)
     try:
@@ -3490,7 +3539,7 @@ def cached_watchlist_dataframe(
             )
             continue
 
-        signal_history = add_signal_columns(history, config)
+        signal_history = add_signal_columns(history, config, symbol=symbol)
         summary = latest_signal_summary(signal_history, config)
         snapshot = lookup_snapshot_row(snapshot_df, symbol)
         intraday_context = build_intraday_context(signal_history, snapshot)
@@ -4443,11 +4492,11 @@ def render_symbol_section(
             option_map[label] = item.symbol
 
     select_col, input_col = st.columns([1.2, 1])
-    selected_label = select_col.selectbox("从扫描结果选择", options=options, index=0 if options else None, placeholder="先执行扫描或手动输入代码")
+    selected_label = select_col.selectbox("从扫描结果选择代码", options=options, index=0 if options else None, placeholder="先执行扫描或手动输入代码")
     manual_symbol = input_col.text_input("手动输入股票代码", value="")
 
     left_col, right_col = st.columns([1, 1])
-    start_date = left_col.date_input("回看起始日", value=date(2024, 1, 1))
+    start_date = left_col.date_input("回测起始日", value=date(2024, 1, 1))
     end_date = right_col.date_input("结束日", value=date.today())
 
     symbol = manual_symbol.strip() or option_map.get(selected_label, "") or "600519"
@@ -4576,55 +4625,6 @@ def render_symbol_section(
     bt8.metric("平均亏损", f"{backtest.avg_loss_return:.2%}")
     st.caption("回测口径：信号在收盘确认，默认按下一交易日开盘价执行。")
     st.caption("单笔期望看每笔平均能赚多少；利润因子看总盈利相对总亏损的放大倍数，比单看胜率更接近真实盈亏质量。")
-
-    signal_stats = analyze_signal_statistics(history)
-    if not signal_stats.empty:
-        display_stats = signal_stats.copy()
-        for column in display_stats.columns:
-            if column.endswith("平均收益") or column.endswith("命中率"):
-                display_stats[column] = display_stats[column].map(
-                    lambda value: f"{value:.2%}" if pd.notna(value) else "-"
-                )
-        st.caption("历史信号统计验证")
-        st.dataframe(display_stats, width="stretch", hide_index=True)
-        st.caption("说明：买点/补仓的命中率表示未来收益为正的比例；卖点/快退的命中率表示信号后股价继续下跌的比例。")
-
-    entry_slice_stats = analyze_entry_slices(history)
-    if not entry_slice_stats.empty:
-        display_entry_slices = entry_slice_stats.copy()
-        for column in display_entry_slices.columns:
-            if column.endswith("平均收益") or column.endswith("命中率"):
-                display_entry_slices[column] = display_entry_slices[column].map(
-                    lambda value: f"{value:.2%}" if pd.notna(value) else "-"
-                )
-        display_entry_slices = display_entry_slices.rename(
-            columns={
-                "signal_kind": "信号类别",
-                "entry_signal_type": "买点类型",
-                "market_regime": "市场环境",
-            }
-        )
-        st.caption("按买点类型与市场环境拆分的 5 日样本表现")
-        st.dataframe(display_entry_slices, width="stretch", hide_index=True)
-        st.caption("这张表更适合看哪类入场在什么环境里更稳定，而不是只看总体胜率。")
-
-    exit_slice_stats = analyze_exit_slices(history)
-    if not exit_slice_stats.empty:
-        display_exit_slices = exit_slice_stats.copy()
-        for column in display_exit_slices.columns:
-            if column.endswith("平均跌幅") or column.endswith("有效率"):
-                display_exit_slices[column] = display_exit_slices[column].map(
-                    lambda value: f"{value:.2%}" if pd.notna(value) else "-"
-                )
-        display_exit_slices = display_exit_slices.rename(
-            columns={
-                "sell_reason": "卖点原因",
-                "market_regime": "市场环境",
-            }
-        )
-        st.caption("按卖点原因与市场环境拆分的 5 日样本表现")
-        st.dataframe(display_exit_slices, width="stretch", hide_index=True)
-        st.caption("这张表更适合看不同离场原因在什么环境里更有效，帮助区分趋势破坏、快退和止损的质量。")
 
     signal_table = history.loc[
         history["buy_signal"] | history["add_on_signal"] | history["sell_signal"],
@@ -4779,6 +4779,17 @@ def render_watchlist_section(config_path: str, config_fingerprint: str, intraday
         display_df,
         ["当前状态", "买点类型", "ATR风控价", "最近卖点原因", "盘中动作", "盘中提示"],
     )
+    average_live_delta = pd.to_numeric(watchlist_df.get("live_delta", pd.Series(dtype=float)), errors="coerce").dropna()
+    average_score = pd.to_numeric(watchlist_df.get("score", pd.Series(dtype=float)), errors="coerce").dropna()
+    dominant_action = "观察"
+    if "action" in watchlist_df.columns and not watchlist_df["action"].dropna().empty:
+        dominant_action = str(watchlist_df["action"].dropna().astype(str).mode().iloc[0])
+    summary_parts = [f"自选池平均动作：{dominant_action}"]
+    if not average_live_delta.empty:
+        summary_parts.append(f"实时偏离 {average_live_delta.mean():+.2%}")
+    if not average_score.empty:
+        summary_parts.append(f"近买点评分 {average_score.mean():.2f}")
+    st.caption(" | ".join(summary_parts))
     st.caption(
         f"当前已跟踪 {len(watchlist_symbols)} 只自选股。操作提示仍以最新完整日线为主；新增的盘中动作/盘中提示只作为快照辅助，不替代收盘确认。"
     )
@@ -4882,6 +4893,14 @@ def main() -> None:
     st.sidebar.subheader("风险控制")
     st.sidebar.write(f"ATR窗口: {config['strategy']['atr_window']} 日")
     st.sidebar.write(f"止损: {config['strategy']['atr_stop_multiple']:.1f} x ATR")
+    
+    # 动态移动止盈止损与ATR自适应保护 (第三步)
+    enable_trailing = config['strategy'].get('enable_trailing_stop', False)
+    st.sidebar.write(f"动态移动止损: {'开启' if enable_trailing else '关闭'}")
+    if enable_trailing:
+        st.sidebar.write(f"自适应保护激活: {config['strategy'].get('atr_profit_activation_multiple', 4.0):.1f} x ATR")
+        st.sidebar.write(f"高位溢价回撤: {config['strategy'].get('atr_profit_retracement_multiple', 1.5):.1f} x ATR")
+    
     st.sidebar.caption("ATR 止损越紧，胜率可能更平滑，但也更容易在强趋势回撤中被提前洗掉。")
     st.sidebar.subheader("结果质量")
     st.sidebar.write(f"严格收盘后模式: {'开启' if config['scan'].get('strict_post_close_mode', False) else '关闭'}")

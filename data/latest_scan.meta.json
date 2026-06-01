@@ -1,8 +1,8 @@
 {
-  "config_fingerprint": "de11d36bd9b7d3e9e9f5c7ed39bf3e1a720edf6296b88c4aab2096c214beef50",
+  "config_fingerprint": "994dfc397e23f0cd5190f6663bda9a961c13f59ed40b472cc1042dfccd4ebf3c",
   "config_path": "config/universe.yaml",
   "scan_source": "complete",
-  "as_of": "2026-04-24",
-  "top_n": 20,
-  "generated_at": "2026-04-24T15:20:50"
+  "as_of": null,
+  "top_n": 15,
+  "generated_at": "2026-05-27T17:05:58"
 }

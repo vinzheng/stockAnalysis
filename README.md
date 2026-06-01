@@ -82,7 +82,8 @@ data/                       本地缓存和扫描结果
 ## 数据源说明
 
 - 全市场快照优先使用 efinance，失败时回退到 AkShare 东方财富接口；如果两者都失败，则优先使用本地缓存的 `data/latest_snapshot.csv`，只在没有缓存时才尝试 AkShare 遗留接口
-- 个股历史日线优先使用 Tushare，失败时再回退到 efinance、AkShare `stock_zh_a_daily`、AkShare `stock_zh_a_hist`，BaoStock 仅保留为最后兜底
+- 当全市场快照缺少换手率时，系统会优先复用本地缓存的 Tushare `daily_basic` 换手率数据进行补全；如果补全源也不可用，扫描会自动跳过最低换手率硬过滤，避免候选池被误清空
+- 个股历史日线优先使用 AkShare `stock_zh_a_daily`，失败时再回退到 efinance、AkShare `stock_zh_a_hist`、Tushare，BaoStock 仅保留为最后兜底；本地可复用缓存始终优先于外部源
 - 基准指数历史默认优先使用 AkShare 指数接口，失败时再回退到 BaoStock 和本地缓存；只有在 `data_source.use_tushare_for_index: true` 时才会优先尝试 Tushare
 - 这意味着单股分析、回测和基于已有快照的扫描，在公开源波动时更容易继续运行
 
@@ -134,7 +135,7 @@ TUSHARE_TOKEN=你的_tushare_token
 python -m ashare_quant.cli preheat --as-of 2026-04-02 --limit 80
 ```
 
-这个命令会先按当前扫描池抽样规则选出候选股，并把它们的历史日线尽量预拉到本地缓存。预热完成后，再执行扫描通常更容易拿到完整结果。
+这个命令会先尝试预热当期交易日对应的 Tushare 换手率缓存，再按当前扫描池抽样规则选出候选股，并把它们的历史日线尽量预拉到本地缓存。预热完成后，再执行扫描通常更容易拿到完整结果。
 
 ```powershell
 python -m ashare_quant.cli scan --top 20

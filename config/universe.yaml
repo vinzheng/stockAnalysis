@@ -24,13 +24,16 @@ strategy:
   rsi_max: 75
   atr_window: 14
   atr_stop_multiple: 2.5
+  enable_trailing_stop: true
+  atr_profit_activation_multiple: 4.0
+  atr_profit_retracement_multiple: 1.5
 
 scan:
   history_days: 260
   history_cache_max_trading_day_lag: 3
   top_n: 15
   strict_post_close_mode: true
-  scan_timeout_seconds: 45
+  scan_timeout_seconds: 120
 
 market_timing:
   enabled: true
